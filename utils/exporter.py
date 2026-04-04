@@ -1,4 +1,4 @@
-import omni.kit.asset_converter as converter
+import isaaclab.kit.asset_converter as converter
 import trimesh
 import os
 
