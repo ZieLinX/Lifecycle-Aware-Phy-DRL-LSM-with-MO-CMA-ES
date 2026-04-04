@@ -1,0 +1,23 @@
+params:
+  seed: 42
+  algo:
+    name: ppo
+  model:
+    name: continuous_a2c_logstd
+  network:
+    name: actor_critic
+    separate: False
+    mlp:
+      units: [1024, 512, 256]
+      activation: elu
+  config:
+    name: CylinderDeformPhysics
+    env_name: rlgpu
+    multi_gpu: False
+    ppo: True
+    mixed_precision: True
+    num_actors: 4096 # 5090 推荐 4096+ 并行
+    reward_shaper:
+      scale_value: 0.1
+    normalize_input: True
+    max_epochs: 1000
