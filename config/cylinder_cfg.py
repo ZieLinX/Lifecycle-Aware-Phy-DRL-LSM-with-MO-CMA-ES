@@ -17,8 +17,8 @@ class CylinderPhysicsCfg:
     height = 15e-3
 
     # Surface discretization
-    num_segments = 48
-    num_rings = 24
+    num_segments = 96
+    num_rings = 48
 
     # Material constants (pure tungsten)
     density = 19350.0                 # kg/m^3
@@ -27,20 +27,26 @@ class CylinderPhysicsCfg:
     k_ref = 120.0                     # W/(m*K) near room/high-T simplified
     k_temp_coeff = -0.025             # W/(m*K^2), conductivity drops with T
     rho_elec_ref = 5.6e-8             # Ohm*m (300K)
-    rho_elec_temp_coeff = 4.5e-3      # 1/K
+    rho_elec_temp_coeff = 3.5e-3      # 1/K, aligned to requirement doc
 
     # Electrical loading
-    applied_voltage = 30.0            # V
+    applied_voltage = 100.0           # V, requirement doc setting
     min_resistance = 1e-6             # Ohm safety lower bound
-    max_current = 3.0e3               # A clamp to avoid blow-up
+    max_current = 5.0e3               # A clamp
+    external_series_resistance = 0.08 # Ohm, power-supply / lead equivalent resistance
+    current_derate_temp_start = 2400.0
+    current_derate_temp_end = 3200.0
+    current_derate_min_scale = 0.10
 
     # Thermal / radiative environment
     ambient_temp = 300.0              # K
     max_temp = 3273.15                # 3000C
     stefan_boltzmann = 5.670374419e-8 # W/(m^2*K^4)
-    emissivity_low = 0.30
-    emissivity_high = 0.55
-    emissivity_transition_temp = 2200.0
+    emissivity_low = 0.45
+    emissivity_high = 0.95
+    emissivity_transition_temp = 1600.0
+    radiative_cooling_scale = 3.2
+    convective_cooling_coeff = 1200.0   # W/(m^2*K), effective external cooling term
 
     # Surface evaporation model: Ye = A * exp(B / T) [g/(cm^2*s)]
     evap_A = 3.9e8
@@ -59,10 +65,16 @@ class CylinderPhysicsCfg:
     min_radius = 8.0e-4
     dent_decay = 0.01
     max_total_dent = 5.0e-4
+    max_total_bulge = 5.0e-4
     dent_active_threshold = 5.0e-6
+    use_strict_shape_projection = True
+    shape_projection_alpha = 1.0
+    dent_polygon_sides = 256
+    viewer_subdivision_scheme = "catmullClark"
 
     # Failure / constraints
     terminate_on_constraints = True
+    visualize_disable_constraints = False
     feature_fail_ratio = 0.20         # |Li(t)-Li(0)|/Li(0) >= 20%
     max_mass_loss_rate = 1.5e-6       # kg/s (soft constraint)
     keep_electrode_rings_fixed = True
@@ -70,7 +82,7 @@ class CylinderPhysicsCfg:
     # Reward shaping
     reward_scale_radiation = 1.0
     penalty_mass_loss = 2.0e5
-    penalty_temp_violation = 2.0e-2
+    penalty_temp_violation = 3.0e-1
     penalty_feature_violation = 120.0
     penalty_volume_change = 80.0
 

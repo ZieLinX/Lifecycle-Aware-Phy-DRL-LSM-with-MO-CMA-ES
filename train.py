@@ -98,6 +98,14 @@ def pick_best_action(env: CylinderPhysicsEnv):
     best_action = None
     best_free_energy = float("inf")
     best_reward = -float("inf")
+    temp_limit = float(env.cfg.max_temp * 1.02)
+    best_feasible_reward = -float("inf")
+    best_feasible_action = None
+    best_feasible_free_energy = float("inf")
+    coolest_action = None
+    coolest_next_temp = float("inf")
+    coolest_reward = -float("inf")
+    coolest_free_energy = float("inf")
 
     for idx in top_indices:
         idx_ratio = idx / max(1, env.num_points - 1)
@@ -106,10 +114,31 @@ def pick_best_action(env: CylinderPhysicsEnv):
                 action = np.array([idx_ratio, depth, sigma], dtype=np.float32)
                 reward, _, info = env.evaluate_action(action)
                 free_energy = float(info["free_energy"])
+                max_temp_next = float(info.get("max_temp", 0.0))
+                feasible = max_temp_next <= temp_limit
+
+                # Hard temperature filter: prefer actions that keep next-step temperature under limit.
+                if feasible and float(reward) > best_feasible_reward:
+                    best_feasible_reward = float(reward)
+                    best_feasible_free_energy = free_energy
+                    best_feasible_action = action
+
+                if max_temp_next < coolest_next_temp:
+                    coolest_next_temp = max_temp_next
+                    coolest_action = action
+                    coolest_reward = float(reward)
+                    coolest_free_energy = free_energy
+
                 if float(reward) > best_reward:
                     best_free_energy = free_energy
                     best_reward = float(reward)
                     best_action = action
+
+    if best_feasible_action is not None:
+        return best_feasible_action, best_feasible_reward, best_feasible_free_energy
+
+    if coolest_action is not None:
+        return coolest_action, coolest_reward, coolest_free_energy
 
     if best_action is None:
         best_action = np.array([0.0, 0.0, env.cfg.min_sigma], dtype=np.float32)
@@ -150,11 +179,13 @@ def run_simulation(
         cfg.max_steps = int(max_steps_override)
     cfg.use_usd_backend = bool(visualize)
     if visualize:
-        # Visualization mode: run full trajectory unless max_steps reached.
-        cfg.terminate_on_constraints = False
+        # Keep constraints unless explicitly disabled in cfg.
+        if getattr(cfg, "visualize_disable_constraints", False):
+            cfg.terminate_on_constraints = False
         # Keep viewer interactive: reduce lookahead search workload.
         cfg.search_top_k = min(cfg.search_top_k, 4)
-        cfg.search_depth_grid = (0.35, 0.70)
+        # Include gentle/no-op actions in visualize mode to avoid thermal runaway.
+        cfg.search_depth_grid = (0.0, 0.10, 0.25)
         cfg.search_sigma_grid = (cfg.min_sigma, 0.5 * (cfg.min_sigma + cfg.max_sigma))
         cfg.log_interval = max(cfg.log_interval, 20)
     env = CylinderPhysicsEnv(cfg)
@@ -217,6 +248,7 @@ def run_simulation(
                 f"F={info['free_energy']:.4f}, "
                 f"Tmax={info['max_temp']:.1f}K, "
                 f"Prad={info['radiation_power']:.4f}W, "
+                f"I={info.get('current_a', 0.0):.1f}A, "
                 f"active_dents={int(info['active_dent_points'])}, "
                 f"max_dent={info['max_dent_depth']:.4f}",
                 flush=True,
