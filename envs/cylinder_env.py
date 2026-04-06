@@ -1,36 +1,20 @@
 import math
 import importlib
-from importlib import util as importlib_util
 from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
-
-def _safe_find_spec(module_name: str):
-    try:
-        return importlib_util.find_spec(module_name)
-    except ModuleNotFoundError:
-        return None
-
-
-isaaclab_usd = importlib.import_module("isaaclab.usd") if _safe_find_spec("isaaclab.usd") else None
-isaaclab_objects = (
-    importlib.import_module("isaaclab.core.objects")
-    if _safe_find_spec("isaaclab.core.objects")
-    else None
-)
-pxr_usdgeom = importlib.import_module("pxr.UsdGeom") if _safe_find_spec("pxr.UsdGeom") else None
 
 
 class CylinderPhysicsEnv:
     """
     Cylindrical thin-shell deformation environment.
 
-    The model combines:
-    1) spring energy (radial restoring force)
-    2) bending-like smoothness energy (graph Laplacian)
-    3) damping and semi-implicit Euler integration
-    4) Helmholtz free-energy objective F = U - T*S
+    Coupled model:
+    1) mechanical deformation on cylindrical lattice
+    2) electro-thermal update with Joule heating + radiation + conduction
+    3) evaporation-driven mass loss and surface recession
+    4) constrained objective balancing radiation performance and lifetime
     """
 
     def __init__(self, cfg):
@@ -39,19 +23,52 @@ class CylinderPhysicsEnv:
         self.use_usd = False
         self.stage = None
         self.mesh = None
+        self._UsdGeom = None
+        self._Sdf = None
+        self._Gf = None
+        self._UsdLux = None
+        self._UsdShade = None
+        self._suppress_usd_sync = False
         self.current_step = 0
 
-        # Try USD-backed simulation first; fallback to tensor-only mode.
-        if isaaclab_usd is not None and isaaclab_objects is not None and pxr_usdgeom is not None:
+        # Optional USD backend: lazy import to avoid SimulationApp import-order issues.
+        if getattr(cfg, "use_usd_backend", False):
             try:
-                self.stage = isaaclab_usd.get_context().get_stage()
-                self.cyl = isaaclab_objects.DynamicCylinder(
-                    prim_path=cfg.prim_path, radius=cfg.radius, height=cfg.height
-                )
-                self.mesh = pxr_usdgeom.Mesh.Get(self.stage, cfg.prim_path)
-                self.use_usd = self.mesh is not None
-            except Exception:
-                self.use_usd = False
+                try:
+                    usd_ctx_module = importlib.import_module("isaaclab.usd")
+                    context = usd_ctx_module.get_context()
+                except Exception:
+                    usd_ctx_module = importlib.import_module("omni.usd")
+                    context = usd_ctx_module.get_context()
+                viewport_stage = None
+                try:
+                    viewport_util = importlib.import_module("omni.kit.viewport.utility")
+                    viewport_api = viewport_util.get_active_viewport()
+                    if viewport_api is not None:
+                        viewport_stage = viewport_api.stage
+                except Exception:
+                    viewport_stage = None
+                self._UsdGeom = importlib.import_module("pxr.UsdGeom")
+                self._Sdf = importlib.import_module("pxr.Sdf")
+                self._Gf = importlib.import_module("pxr.Gf")
+                self._UsdLux = importlib.import_module("pxr.UsdLux")
+                self._UsdShade = importlib.import_module("pxr.UsdShade")
+                self.stage = viewport_stage if viewport_stage is not None else context.get_stage()
+                if self.stage is None:
+                    context.new_stage()
+                    self.stage = context.get_stage()
+                if self.stage is not None:
+                    root = self.stage.GetRootLayer()
+                    root_id = root.identifier if root is not None else "<no-root-layer>"
+                    print(f"[viewer] using stage root: {root_id}", flush=True)
+            except Exception as exc:
+                print(f"[viewer] USD backend init failed: {exc}", flush=True)
+                self.stage = None
+                self._UsdGeom = None
+                self._Sdf = None
+                self._Gf = None
+                self._UsdLux = None
+                self._UsdShade = None
 
         self.rest_points, self.neighbors = self._build_cylinder_lattice(
             radius=cfg.radius,
@@ -63,9 +80,33 @@ class CylinderPhysicsEnv:
         self.points = self.rest_points.clone()
         self.velocity = torch.zeros_like(self.points)
         self.dent_field = torch.zeros(self.points.shape[0], dtype=torch.float32, device=self.device)
+        self.temperature = torch.full(
+            (self.points.shape[0],),
+            float(self.cfg.ambient_temp),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.ablation_depth = torch.zeros_like(self.temperature)
         self.num_points = self.points.shape[0]
-        self.obs_dim = self.num_points * 3
         self.neighbor_index, self.neighbor_mask = self._build_neighbor_tensor(self.neighbors, self.device)
+        self.ring_index = self._build_ring_index(cfg.num_segments, cfg.num_rings, self.device)
+        self.area_per_point = (2.0 * math.pi * cfg.radius * cfg.height) / self.num_points
+        self.dx = min(
+            2.0 * math.pi * cfg.radius / max(cfg.num_segments, 1),
+            cfg.height / max(cfg.num_rings - 1, 1),
+        )
+        self.initial_volume = math.pi * cfg.radius * cfg.radius * cfg.height
+        self.initial_mass = self.initial_volume * cfg.density
+        self.remaining_mass = self.initial_mass
+        self.obs_dim = self.num_points * 5
+        if self.stage is not None and self._UsdGeom is not None and self._Sdf is not None:
+            try:
+                self._ensure_default_lights()
+                self.mesh = self._init_usd_mesh(self._UsdGeom, self._Sdf)
+                self.use_usd = self.mesh is not None
+            except Exception as exc:
+                print(f"[viewer] USD mesh creation failed: {exc}", flush=True)
+                self.use_usd = False
 
     @staticmethod
     def _build_neighbor_tensor(neighbors: List[List[int]], device: torch.device):
@@ -78,6 +119,103 @@ class CylinderPhysicsEnv:
             index[i, :k] = torch.tensor(nbrs, dtype=torch.long, device=device)
             mask[i, :k] = 1.0
         return index, mask
+
+    @staticmethod
+    def _build_ring_index(num_segments: int, num_rings: int, device: torch.device) -> torch.Tensor:
+        idx = []
+        for r_idx in range(num_rings):
+            for _ in range(num_segments):
+                idx.append(r_idx)
+        return torch.tensor(idx, dtype=torch.long, device=device)
+
+    @staticmethod
+    def _build_surface_faces(num_segments: int, num_rings: int) -> np.ndarray:
+        faces = []
+        for r_idx in range(num_rings - 1):
+            ring0 = r_idx * num_segments
+            ring1 = (r_idx + 1) * num_segments
+            for s_idx in range(num_segments):
+                s_next = (s_idx + 1) % num_segments
+                i0 = ring0 + s_idx
+                i1 = ring0 + s_next
+                i2 = ring1 + s_idx
+                i3 = ring1 + s_next
+                faces.append([i0, i2, i1])
+                faces.append([i1, i2, i3])
+        return np.asarray(faces, dtype=np.int64)
+
+    def _init_usd_mesh(self, UsdGeom, Sdf):
+        UsdGeom.Xform.Define(self.stage, "/World")
+        old_prim = self.stage.GetPrimAtPath(self.cfg.prim_path)
+        if old_prim and old_prim.IsValid():
+            self.stage.RemovePrim(self.cfg.prim_path)
+        mesh = UsdGeom.Mesh.Define(self.stage, self.cfg.prim_path)
+        faces = self._build_surface_faces(self.cfg.num_segments, self.cfg.num_rings)
+        points_np = self._to_viewer_points(self.rest_points.detach().cpu().numpy())
+        mesh.GetFaceVertexCountsAttr().Set([3] * int(faces.shape[0]))
+        mesh.GetFaceVertexIndicesAttr().Set(faces.reshape(-1).tolist())
+        mesh.GetPointsAttr().Set(points_np)
+        pmin = points_np.min(axis=0).tolist()
+        pmax = points_np.max(axis=0).tolist()
+        mesh.CreateExtentAttr().Set([pmin, pmax])
+        mesh.CreateDoubleSidedAttr().Set(True)
+        mesh.GetSubdivisionSchemeAttr().Set("none")
+        mesh.GetVisibilityAttr().Set("inherited")
+        prim = mesh.GetPrim()
+        if prim:
+            prim.CreateAttribute("primvars:displayColor", Sdf.ValueTypeNames.Color3fArray).Set([(0.95, 0.95, 0.98)])
+            prim.CreateAttribute("primvars:displayOpacity", Sdf.ValueTypeNames.FloatArray).Set([1.0])
+            self._bind_visible_material(prim)
+        print(
+            f"[viewer] USD mesh ready at {self.cfg.prim_path} "
+            f"(verts={points_np.shape[0]}, faces={faces.shape[0]}, scale={getattr(self.cfg, 'viewer_scale', 1.0)})",
+            flush=True,
+        )
+        return mesh
+
+    def _to_viewer_points(self, points_np: np.ndarray) -> np.ndarray:
+        s = float(getattr(self.cfg, "viewer_scale", 1.0))
+        lift = float(getattr(self.cfg, "viewer_lift_z", 0.0))
+        out = points_np.copy()
+        out *= s
+        out[:, 2] += lift
+        return out
+
+    def _ensure_default_lights(self):
+        if self._UsdLux is None:
+            return
+        if not self.stage.GetPrimAtPath("/World/KeyLight"):
+            key = self._UsdLux.DistantLight.Define(self.stage, "/World/KeyLight")
+            key.CreateIntensityAttr(3500.0)
+            key.CreateColorAttr((1.0, 1.0, 1.0))
+        if not self.stage.GetPrimAtPath("/World/FillLight"):
+            fill = self._UsdLux.DistantLight.Define(self.stage, "/World/FillLight")
+            fill.CreateIntensityAttr(1400.0)
+            fill.CreateColorAttr((0.9, 0.92, 1.0))
+        if not self.stage.GetPrimAtPath("/World/SideLight"):
+            side = self._UsdLux.DistantLight.Define(self.stage, "/World/SideLight")
+            side.CreateIntensityAttr(1100.0)
+            side.CreateColorAttr((1.0, 0.98, 0.95))
+        if not self.stage.GetPrimAtPath("/World/DomeLight"):
+            dome = self._UsdLux.DomeLight.Define(self.stage, "/World/DomeLight")
+            dome.CreateIntensityAttr(120.0)
+            dome.CreateColorAttr((1.0, 1.0, 1.0))
+
+    def _bind_visible_material(self, prim):
+        if self._UsdShade is None or self._Sdf is None:
+            return
+        mat_path = "/World/VisibleMaterial"
+        material = self._UsdShade.Material.Define(self.stage, mat_path)
+        shader = self._UsdShade.Shader.Define(self.stage, f"{mat_path}/PreviewSurface")
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput("diffuseColor", self._Sdf.ValueTypeNames.Color3f).Set((1.0, 1.0, 1.0))
+        shader.CreateInput("roughness", self._Sdf.ValueTypeNames.Float).Set(0.35)
+        shader.CreateInput("metallic", self._Sdf.ValueTypeNames.Float).Set(0.60)
+        shader.CreateInput("emissiveColor", self._Sdf.ValueTypeNames.Color3f).Set((0.08, 0.08, 0.08))
+        shader.CreateInput("opacity", self._Sdf.ValueTypeNames.Float).Set(1.0)
+        shader.CreateInput("opacityThreshold", self._Sdf.ValueTypeNames.Float).Set(0.0)
+        material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+        self._UsdShade.MaterialBindingAPI(prim).Bind(material)
 
     @staticmethod
     def _build_cylinder_lattice(
@@ -116,24 +254,81 @@ class CylinderPhysicsEnv:
         nbr_mean = (nbr_values * self.neighbor_mask).sum(dim=1) / self.neighbor_mask.sum(dim=1).clamp_min(1.0)
         return radial_disp - nbr_mean
 
-    def _sync_from_usd(self):
-        if not self.use_usd:
+    def _laplacian_scalar(self, values: torch.Tensor) -> torch.Tensor:
+        nbr_values = values[self.neighbor_index]
+        nbr_mean = (nbr_values * self.neighbor_mask).sum(dim=1) / self.neighbor_mask.sum(dim=1).clamp_min(1.0)
+        return nbr_mean - values
+
+    def _build_observation(self) -> np.ndarray:
+        radial = torch.norm(self.points[:, :2], dim=1)
+        radial_disp = radial - self.cfg.radius
+        temp_norm = (self.temperature - self.cfg.ambient_temp) / max(self.cfg.max_temp - self.cfg.ambient_temp, 1.0)
+        obs = torch.cat(
+            [
+                self.points.flatten(),
+                self.velocity.flatten(),
+                radial_disp.flatten(),
+                temp_norm.flatten(),
+                self.ablation_depth.flatten(),
+            ]
+        )
+        return obs.detach().cpu().numpy()
+
+    def _material_properties(self, temperature: torch.Tensor):
+        delta = torch.clamp(temperature - 300.0, min=0.0)
+        cp = self.cfg.cp_ref + self.cfg.cp_temp_coeff * delta
+        k = torch.clamp(self.cfg.k_ref + self.cfg.k_temp_coeff * delta, min=20.0)
+        rho_elec = self.cfg.rho_elec_ref * (1.0 + self.cfg.rho_elec_temp_coeff * delta)
+        emissivity = self.cfg.emissivity_low + (
+            self.cfg.emissivity_high - self.cfg.emissivity_low
+        ) * torch.sigmoid((temperature - self.cfg.emissivity_transition_temp) / 220.0)
+        return cp, k, rho_elec, emissivity
+
+    def _evaporation_flux_kg_m2_s(self, temperature: torch.Tensor) -> torch.Tensor:
+        # Input law in g/(cm^2*s); convert to kg/(m^2*s) by factor 10.
+        y_g_cm2_s = self.cfg.evap_A * torch.exp(self.cfg.evap_B / torch.clamp(temperature, min=1.0))
+        return y_g_cm2_s * 10.0
+
+    def _surface_area_to_volume_ratio(self, radius: torch.Tensor) -> torch.Tensor:
+        r = torch.clamp(radius, min=self.cfg.min_radius)
+        return 2.0 / r
+
+    def _apply_electrode_constraints(self):
+        if not self.cfg.keep_electrode_rings_fixed:
             return
-        points_usd = self.mesh.GetPointsAttr().Get()
-        if points_usd is not None:
-            self.points = torch.tensor(np.array(points_usd), dtype=torch.float32, device=self.device)
+        first_ring = self.ring_index == 0
+        last_ring = self.ring_index == int(torch.max(self.ring_index).item())
+        locked = first_ring | last_ring
+        self.points[locked] = self.rest_points[locked]
+        self.velocity[locked] = 0.0
+        self.ablation_depth[locked] = 0.0
+        self.dent_field[locked] = 0.0
+
+    def _sync_from_usd(self):
+        if not self.use_usd or self._suppress_usd_sync:
+            return
+        # Keep physics state as source of truth; avoid pulling back transformed viewer points.
+        return
 
     def _sync_to_usd(self):
-        if self.use_usd:
-            self.mesh.GetPointsAttr().Set(self.points.detach().cpu().numpy())
+        if self.use_usd and not self._suppress_usd_sync:
+            self.mesh.GetPointsAttr().Set(self._to_viewer_points(self.points.detach().cpu().numpy()))
 
     def reset(self):
         self.current_step = 0
         self.points = self.rest_points.clone()
         self.velocity = torch.zeros_like(self.points)
         self.dent_field = torch.zeros(self.num_points, dtype=torch.float32, device=self.device)
+        self.temperature = torch.full(
+            (self.num_points,),
+            float(self.cfg.ambient_temp),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.ablation_depth = torch.zeros(self.num_points, dtype=torch.float32, device=self.device)
+        self.remaining_mass = self.initial_mass
         self._sync_to_usd()
-        return self.points.flatten().detach().cpu().numpy()
+        return self._build_observation()
 
     def get_state(self):
         """Return a detached snapshot for action lookahead."""
@@ -141,6 +336,9 @@ class CylinderPhysicsEnv:
             "points": self.points.clone(),
             "velocity": self.velocity.clone(),
             "dent_field": self.dent_field.clone(),
+            "temperature": self.temperature.clone(),
+            "ablation_depth": self.ablation_depth.clone(),
+            "remaining_mass": float(self.remaining_mass),
             "current_step": self.current_step,
         }
 
@@ -149,6 +347,9 @@ class CylinderPhysicsEnv:
         self.points = state["points"].clone()
         self.velocity = state["velocity"].clone()
         self.dent_field = state["dent_field"].clone()
+        self.temperature = state["temperature"].clone()
+        self.ablation_depth = state["ablation_depth"].clone()
+        self.remaining_mass = float(state["remaining_mass"])
         self.current_step = int(state["current_step"])
         self._sync_to_usd()
 
@@ -158,8 +359,12 @@ class CylinderPhysicsEnv:
         simulate action and restore state afterwards.
         """
         snapshot = self.get_state()
-        _, reward, done, info = self.step(actions)
-        self.set_state(snapshot)
+        self._suppress_usd_sync = True
+        try:
+            _, reward, done, info = self.step(actions)
+            self.set_state(snapshot)
+        finally:
+            self._suppress_usd_sync = False
         return reward, done, info
 
     def compute_free_energy(self, points: torch.Tensor, velocity: torch.Tensor) -> torch.Tensor:
@@ -174,12 +379,22 @@ class CylinderPhysicsEnv:
         u_bend = 0.5 * self.cfg.k_bend * torch.sum(lap.pow(2))
 
         # Kinetic term
-        kinetic = 0.5 * self.cfg.mass * torch.sum(velocity.pow(2))
+        kinetic = 0.5 * self.cfg.mass_lumped * torch.sum(velocity.pow(2))
 
         # Entropy proxy: variance of local displacement field
         entropy = torch.var(radial_disp)
 
-        return (u_spring + u_bend + kinetic) - (self.cfg.temp_k * entropy)
+        return (u_spring + u_bend + kinetic) - (self.cfg.ambient_temp * entropy)
+
+    def _compute_volume(self, points: torch.Tensor) -> float:
+        radius = torch.norm(points[:, :2], dim=1).mean().item()
+        return math.pi * radius * radius * self.cfg.height
+
+    def _compute_feature_change_ratio(self, points: torch.Tensor) -> float:
+        radius_mean = torch.norm(points[:, :2], dim=1).mean()
+        radius_ratio = torch.abs(radius_mean - self.cfg.radius) / max(self.cfg.radius, 1e-12)
+        ablation_ratio = torch.max(self.ablation_depth) / max(self.cfg.radius, 1e-12)
+        return float(torch.max(radius_ratio, ablation_ratio).item())
 
     def step(self, actions):
         self.current_step += 1
@@ -226,7 +441,7 @@ class CylinderPhysicsEnv:
 
         # Damping + integration.
         force_total = f_ext + f_internal - self.cfg.damping * self.velocity
-        acc = force_total / self.cfg.mass
+        acc = force_total / self.cfg.mass_lumped
         self.velocity = self.velocity + acc * self.cfg.dt
         self.points = self.points + self.velocity * self.cfg.dt
 
@@ -238,16 +453,86 @@ class CylinderPhysicsEnv:
             self.points[:, :2] = torch.where(collapsed, xy / r * self.cfg.min_radius, xy)
             self.velocity[:, :2] *= (~collapsed).float()
 
+        # --------------------- Electro-thermal + evaporation ---------------------
+        cp, k, rho_elec, emissivity = self._material_properties(self.temperature)
+        radius_now = torch.norm(self.points[:, :2], dim=1).clamp_min(self.cfg.min_radius)
+        mean_radius = torch.mean(radius_now)
+        cross_area = math.pi * float(mean_radius.item()) ** 2
+        resistance = max(
+            float(torch.mean(rho_elec).item()) * self.cfg.height / max(cross_area, 1e-12),
+            self.cfg.min_resistance,
+        )
+        current = float(np.clip(self.cfg.applied_voltage / resistance, 0.0, self.cfg.max_current))
+        current_density = current / max(cross_area, 1e-12)
+
+        q_joule = (current_density**2) * rho_elec
+        temp_lap = self._laplacian_scalar(self.temperature)
+        sa_over_vol = self._surface_area_to_volume_ratio(radius_now)
+        q_rad = emissivity * self.cfg.stefan_boltzmann * (
+            self.temperature.pow(4) - self.cfg.ambient_temp**4
+        )
+
+        evap_flux = self._evaporation_flux_kg_m2_s(self.temperature)
+        q_evap = evap_flux * self.cfg.latent_heat_evap
+        alpha = k / (self.cfg.density * cp)
+        dT_dt = (
+            q_joule / (self.cfg.density * cp)
+            + alpha * temp_lap / max(self.dx * self.dx, 1e-12)
+            - (q_rad + q_evap) * sa_over_vol / (self.cfg.density * cp)
+        )
+        self.temperature = torch.clamp(
+            self.temperature + dT_dt * self.cfg.dt,
+            min=self.cfg.ambient_temp,
+            max=self.cfg.max_temp * 1.2,
+        )
+
+        dm_point = evap_flux * self.area_per_point * self.cfg.dt
+        dm_total = float(torch.sum(dm_point).item())
+        self.remaining_mass = max(self.remaining_mass - dm_total, 0.0)
+        thickness_loss = dm_point / (self.cfg.density * self.area_per_point + 1e-12)
+        self.ablation_depth = self.ablation_depth + thickness_loss
+        self.points[:, :2] = self.points[:, :2] - radial_dir * thickness_loss.unsqueeze(1)
+
+        self._apply_electrode_constraints()
+
         self._sync_to_usd()
 
+        # ------------------------------ Objective --------------------------------
         free_energy = self.compute_free_energy(self.points, self.velocity)
-        reward = -free_energy.item()
-        done = self.current_step >= self.cfg.max_steps
+        current_volume = self._compute_volume(self.points)
+        volume_change_ratio = abs(current_volume - self.initial_volume) / max(self.initial_volume, 1e-12)
+        feature_change_ratio = self._compute_feature_change_ratio(self.points)
+        max_temp_violation = max(float(torch.max(self.temperature).item() - self.cfg.max_temp), 0.0)
+        mass_loss_rate = dm_total / max(self.cfg.dt, 1e-12)
+
+        q_rad_net = torch.sum(q_rad * self.area_per_point)
+        reward = (
+            self.cfg.reward_scale_radiation * float(q_rad_net.item())
+            - self.cfg.penalty_mass_loss * max(mass_loss_rate - self.cfg.max_mass_loss_rate, 0.0)
+            - self.cfg.penalty_temp_violation * (max_temp_violation**2)
+            - self.cfg.penalty_feature_violation * max(feature_change_ratio - self.cfg.feature_fail_ratio, 0.0)
+            - self.cfg.penalty_volume_change * volume_change_ratio
+            - 0.02 * float(free_energy.item())
+        )
+
+        fail_feature = feature_change_ratio >= self.cfg.feature_fail_ratio
+        fail_temp = torch.max(self.temperature).item() >= self.cfg.max_temp * 1.02
+        if getattr(self.cfg, "terminate_on_constraints", True):
+            done = self.current_step >= self.cfg.max_steps or fail_feature or fail_temp
+        else:
+            done = self.current_step >= self.cfg.max_steps
         info: Dict[str, float] = {
             "free_energy": float(free_energy.item()),
             "mean_radius": float(torch.norm(self.points[:, :2], dim=1).mean().item()),
             "active_dent_points": float((torch.abs(self.dent_field) > self.cfg.dent_active_threshold).sum().item()),
             "max_dent_depth": float(torch.abs(self.dent_field).max().item()),
+            "mean_temp": float(torch.mean(self.temperature).item()),
+            "max_temp": float(torch.max(self.temperature).item()),
+            "mass_loss_rate": float(mass_loss_rate),
+            "remaining_mass": float(self.remaining_mass),
+            "volume_change_ratio": float(volume_change_ratio),
+            "feature_change_ratio": float(feature_change_ratio),
+            "radiation_power": float(q_rad_net.item()),
             "step": float(self.current_step),
         }
-        return self.points.flatten().detach().cpu().numpy(), reward, done, info
+        return self._build_observation(), reward, done, info
