@@ -1,13 +1,15 @@
-import numpy as np
-import torch
+import json
 import os
 import csv
 import time
 import argparse
 import importlib
+
+import numpy as np
 from config.cylinder_cfg import CylinderPhysicsCfg
 from envs.cylinder_env import CylinderPhysicsEnv
 from utils.exporter import export_env_mesh
+from utils.planner import plan_action
 
 
 def frame_viewport_on_prims(prim_paths):
@@ -52,107 +54,15 @@ def frame_viewport_on_prims(prim_paths):
     except Exception as exc:
         print(f"[viewer] Could not auto-frame viewport ({exc}). Manual F may be needed.", flush=True)
 
-def pick_best_action(env: CylinderPhysicsEnv):
-    """
-    Greedy one-step optimizer.
-    It searches candidate dent positions and amplitudes, then picks
-    the action that yields the lowest next-step free energy.
-    """
-    points = env.points
-    radial = torch.norm(points[:, :2], dim=1)
-    radial_disp = radial - env.cfg.radius
-
-    # Focus on outward bulges and thermal hotspots.
-    candidate_k = min(env.cfg.search_top_k, env.num_points)
-    top_shape = torch.topk(radial_disp, k=candidate_k, largest=True).indices.tolist()
-    top_temp = torch.topk(env.temperature, k=candidate_k, largest=True).indices.tolist()
-    top_indices = list(dict.fromkeys(top_shape + top_temp))
-
-    # Skip fixed electrode rings so deformation actions affect free surface.
-    if env.cfg.keep_electrode_rings_fixed:
-        ring_max = int(torch.max(env.ring_index).item())
-        movable_mask = (env.ring_index != 0) & (env.ring_index != ring_max)
-        top_indices = [i for i in top_indices if bool(movable_mask[i].item())]
-
-    # If shell is already mostly non-bulged, still allow sparse global probing.
-    if float(radial_disp.max().item()) < 1e-4:
-        coarse = np.linspace(0, env.num_points - 1, num=min(12, env.num_points), dtype=int).tolist()
-        if env.cfg.keep_electrode_rings_fixed:
-            ring_max = int(torch.max(env.ring_index).item())
-            movable_mask = (env.ring_index != 0) & (env.ring_index != ring_max)
-            coarse = [i for i in coarse if bool(movable_mask[i].item())]
-        top_indices = list(dict.fromkeys(top_indices + coarse))
-
-    # Fallback: if all candidates got filtered out, sample from movable region.
-    if not top_indices:
-        if env.cfg.keep_electrode_rings_fixed:
-            ring_max = int(torch.max(env.ring_index).item())
-            movable = torch.where((env.ring_index != 0) & (env.ring_index != ring_max))[0].tolist()
-            top_indices = movable[:candidate_k] if movable else [0]
-        else:
-            top_indices = list(range(candidate_k))
-
-    depth_grid = list(env.cfg.search_depth_grid)
-    sigma_grid = list(env.cfg.search_sigma_grid)
-
-    best_action = None
-    best_free_energy = float("inf")
-    best_reward = -float("inf")
-    temp_limit = float(env.cfg.max_temp * 1.02)
-    best_feasible_reward = -float("inf")
-    best_feasible_action = None
-    best_feasible_free_energy = float("inf")
-    coolest_action = None
-    coolest_next_temp = float("inf")
-    coolest_reward = -float("inf")
-    coolest_free_energy = float("inf")
-
-    for idx in top_indices:
-        idx_ratio = idx / max(1, env.num_points - 1)
-        for depth in depth_grid:
-            for sigma in sigma_grid:
-                action = np.array([idx_ratio, depth, sigma], dtype=np.float32)
-                reward, _, info = env.evaluate_action(action)
-                free_energy = float(info["free_energy"])
-                max_temp_next = float(info.get("max_temp", 0.0))
-                feasible = max_temp_next <= temp_limit
-
-                # Hard temperature filter: prefer actions that keep next-step temperature under limit.
-                if feasible and float(reward) > best_feasible_reward:
-                    best_feasible_reward = float(reward)
-                    best_feasible_free_energy = free_energy
-                    best_feasible_action = action
-
-                if max_temp_next < coolest_next_temp:
-                    coolest_next_temp = max_temp_next
-                    coolest_action = action
-                    coolest_reward = float(reward)
-                    coolest_free_energy = free_energy
-
-                if float(reward) > best_reward:
-                    best_free_energy = free_energy
-                    best_reward = float(reward)
-                    best_action = action
-
-    if best_feasible_action is not None:
-        return best_feasible_action, best_feasible_reward, best_feasible_free_energy
-
-    if coolest_action is not None:
-        return coolest_action, coolest_reward, coolest_free_energy
-
-    if best_action is None:
-        best_action = np.array([0.0, 0.0, env.cfg.min_sigma], dtype=np.float32)
-    return best_action, best_reward, best_free_energy
-
-
 def run_simulation(
     visualize: bool = False,
     pause: float = 0.02,
     headless: bool = False,
     hold: bool = False,
     max_steps_override: int | None = None,
+    fast_smoke: bool = False,
 ):
-    """Run optimization policy rollout for coupled multiphysics objective."""
+    """Run offline geometry-optimization rollout for the coupled multiphysics objective."""
     simulation_app = None
     if visualize:
         SimulationApp = importlib.import_module("isaacsim").SimulationApp
@@ -177,6 +87,20 @@ def run_simulation(
     cfg = CylinderPhysicsCfg()
     if max_steps_override is not None:
         cfg.max_steps = int(max_steps_override)
+    if fast_smoke:
+        cfg.num_segments = 32
+        cfg.num_rings = 16
+        cfg.search_top_k = min(cfg.search_top_k, 4)
+        cfg.search_depth_grid = (0.0, 0.35, 0.70)
+        cfg.search_sigma_grid = (cfg.min_sigma, 0.5 * (cfg.min_sigma + cfg.max_sigma))
+        cfg.voltage_grid_points = min(cfg.voltage_grid_points, 7)
+        cfg.voltage_refine_levels = min(cfg.voltage_refine_levels, 1)
+        cfg.max_steps = min(cfg.max_steps, 4)
+        cfg.planner_horizon = 1
+        cfg.planner_beam_width = min(cfg.planner_beam_width, 2)
+        cfg.planner_seed_top_k = min(cfg.planner_seed_top_k, 4)
+        cfg.planner_candidate_top_k = min(cfg.planner_candidate_top_k, 2)
+        cfg.planner_local_refine_top_k = min(cfg.planner_local_refine_top_k, 1)
     cfg.use_usd_backend = bool(visualize)
     if visualize:
         # Keep constraints unless explicitly disabled in cfg.
@@ -187,6 +111,11 @@ def run_simulation(
         # Include gentle/no-op actions in visualize mode to avoid thermal runaway.
         cfg.search_depth_grid = (0.0, 0.10, 0.25)
         cfg.search_sigma_grid = (cfg.min_sigma, 0.5 * (cfg.min_sigma + cfg.max_sigma))
+        cfg.planner_horizon = 1
+        cfg.planner_beam_width = 2
+        cfg.planner_seed_top_k = min(cfg.planner_seed_top_k, 4)
+        cfg.planner_candidate_top_k = min(cfg.planner_candidate_top_k, 2)
+        cfg.planner_local_refine_top_k = min(cfg.planner_local_refine_top_k, 1)
         cfg.log_interval = max(cfg.log_interval, 20)
     env = CylinderPhysicsEnv(cfg)
     if visualize and not env.use_usd:
@@ -209,6 +138,7 @@ def run_simulation(
     )
 
     obs = env.reset()
+    baseline_metrics = env.baseline_metrics
     free_energies = []
     rewards = []
     chosen_actions = []
@@ -217,7 +147,8 @@ def run_simulation(
     for step_idx in range(cfg.max_steps):
         if simulation_app is not None and not simulation_app.is_running():
             break
-        action, _, _ = pick_best_action(env)
+        decision = plan_action(env)
+        action = decision.action
         obs, reward, done, info = env.step(action)
         if simulation_app is not None:
             simulation_app.update()
@@ -230,13 +161,23 @@ def run_simulation(
             {
                 "step": int(info["step"]),
                 "reward": float(reward),
+                "score": float(info["score"]),
                 "free_energy": float(info["free_energy"]),
+                "rated_voltage_v": float(info["rated_voltage_v"]),
                 "radiation_power": float(info["radiation_power"]),
+                "average_radiation_power": float(info["average_radiation_power"]),
                 "mean_temp": float(info["mean_temp"]),
                 "max_temp": float(info["max_temp"]),
                 "mass_loss_rate": float(info["mass_loss_rate"]),
+                "lifetime_s": float(info["lifetime_s"]),
+                "lifetime_ratio": float(info["lifetime_ratio"]),
+                "band_efficiency": float(info["band_efficiency"]),
+                "temperature_uniformity": float(info["temperature_uniformity"]),
                 "feature_change_ratio": float(info["feature_change_ratio"]),
                 "volume_change_ratio": float(info["volume_change_ratio"]),
+                "thermal_iterations": float(info["thermal_iterations"]),
+                "thermal_residual_k": float(info["thermal_residual_k"]),
+                "thermal_converged": float(info["thermal_converged"]),
                 "active_dent_points": int(info["active_dent_points"]),
                 "max_dent_depth": float(info["max_dent_depth"]),
             }
@@ -244,10 +185,16 @@ def run_simulation(
         if (step_idx + 1) % cfg.log_interval == 0 or step_idx == 0:
             print(
                 f"[{step_idx + 1:03d}/{cfg.max_steps}] "
-                f"R={reward:.4f}, "
+                f"dScore={reward:.4f}, "
+                f"Score={info['score']:.4f}, "
                 f"F={info['free_energy']:.4f}, "
+                f"V*={info['rated_voltage_v']:.1f}V, "
                 f"Tmax={info['max_temp']:.1f}K, "
-                f"Prad={info['radiation_power']:.4f}W, "
+                f"P0-3={info['radiation_power']:.4f}W, "
+                f"Pavg={info['average_radiation_power']:.4f}W, "
+                f"life={info['lifetime_ratio']:.3f}, "
+                f"lookahead={decision.projected_return:.4f}, "
+                f"thermal_iters={int(info['thermal_iterations'])}, "
                 f"I={info.get('current_a', 0.0):.1f}A, "
                 f"active_dents={int(info['active_dent_points'])}, "
                 f"max_dent={info['max_dent_depth']:.4f}",
@@ -261,13 +208,14 @@ def run_simulation(
     print(f"Steps: {len(free_energies)}")
     print(f"Best policy actions sampled: {len(chosen_actions)}")
     print(f"Free energy | min: {min(free_energies):.4f}, max: {max(free_energies):.4f}, final: {free_energies[-1]:.4f}")
-    print(f"Reward      | mean: {np.mean(rewards):.4f}, final: {rewards[-1]:.4f}")
+    print(f"Score delta  | mean: {np.mean(rewards):.4f}, final: {rewards[-1]:.4f}")
 
     out_dir = os.path.abspath("outputs")
     os.makedirs(out_dir, exist_ok=True)
     metrics_csv = os.path.join(out_dir, "rollout_metrics.csv")
     actions_npy = os.path.join(out_dir, "actions.npy")
     obs_npy = os.path.join(out_dir, "last_observation.npy")
+    summary_json = os.path.join(out_dir, "run_summary.json")
 
     if history:
         with open(metrics_csv, "w", newline="") as f:
@@ -280,6 +228,44 @@ def run_simulation(
     print(f"Saved actions to: {actions_npy}")
     print(f"Saved final observation to: {obs_npy}")
 
+    final_metrics = env.current_metrics
+    if baseline_metrics is not None and final_metrics is not None:
+        summary = {
+            "device": str(env.device),
+            "steps": len(history),
+            "baseline_voltage_v": float(baseline_metrics.voltage_v),
+            "final_voltage_v": float(final_metrics.voltage_v),
+            "baseline_initial_power_w": float(baseline_metrics.initial_net_band_power_w),
+            "final_initial_power_w": float(final_metrics.initial_net_band_power_w),
+            "baseline_average_power_w": float(baseline_metrics.average_net_band_power_w),
+            "final_average_power_w": float(final_metrics.average_net_band_power_w),
+            "baseline_lifetime_s": float(baseline_metrics.lifetime_s),
+            "final_lifetime_s": float(final_metrics.lifetime_s),
+            "baseline_max_temp_k": float(baseline_metrics.max_temperature_k),
+            "final_max_temp_k": float(final_metrics.max_temperature_k),
+            "initial_power_ratio": float(
+                final_metrics.initial_net_band_power_w / max(baseline_metrics.initial_net_band_power_w, 1.0e-9)
+            ),
+            "average_power_ratio": float(
+                final_metrics.average_net_band_power_w / max(baseline_metrics.average_net_band_power_w, 1.0e-9)
+            ),
+            "lifetime_ratio": float(final_metrics.lifetime_s / max(baseline_metrics.lifetime_s, 1.0e-9)),
+            "feature_change_ratio": float(final_metrics.feature_change_ratio),
+            "volume_change_ratio": float(final_metrics.volume_change_ratio),
+            "feasible": bool(final_metrics.feasible),
+        }
+        with open(summary_json, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        print(f"Saved run summary to: {summary_json}")
+        print(
+            "[summary] "
+            f"P0-3 ratio={summary['initial_power_ratio']:.4f}, "
+            f"Pavg ratio={summary['average_power_ratio']:.4f}, "
+            f"life ratio={summary['lifetime_ratio']:.4f}, "
+            f"feasible={summary['feasible']}",
+            flush=True,
+        )
+
     exported = export_env_mesh(
         env=env,
         output_dir=out_dir,
@@ -287,6 +273,7 @@ def run_simulation(
         export_step=True,
     )
     print(f"Exported STL: {exported['stl']}")
+    print(f"Export mesh watertight: {exported.get('watertight', False)}")
     if exported["stp"] is not None:
         print(f"Exported STP: {exported['stp']}")
     else:
@@ -300,12 +287,13 @@ def run_simulation(
         simulation_app.close()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run cylinder optimization training.")
+    parser = argparse.ArgumentParser(description="Run offline cylinder geometry optimization.")
     parser.add_argument("--visualize", action="store_true", help="Run with Isaac Sim window live updates.")
     parser.add_argument("--pause", type=float, default=0.2, help="Sleep seconds between visualized steps.")
     parser.add_argument("--headless", action="store_true", help="When visualizing, run Isaac Sim without viewport.")
     parser.add_argument("--hold", action="store_true", help="Keep viewer open after training until manually closed.")
     parser.add_argument("--max-steps", type=int, default=None, help="Override max simulation steps from config.")
+    parser.add_argument("--fast-smoke", action="store_true", help="Run a reduced CPU-friendly smoke configuration.")
     args = parser.parse_args()
     run_simulation(
         visualize=args.visualize,
@@ -313,4 +301,5 @@ if __name__ == "__main__":
         headless=args.headless,
         hold=args.hold,
         max_steps_override=args.max_steps,
+        fast_smoke=args.fast_smoke,
     )

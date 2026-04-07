@@ -5,6 +5,8 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 
+from utils.rated_condition import RatedConditionMetrics, ring_radii_from_points, search_rated_condition
+
 
 class CylinderPhysicsEnv:
     """
@@ -99,7 +101,11 @@ class CylinderPhysicsEnv:
         self.initial_volume = math.pi * cfg.radius * cfg.radius * cfg.height
         self.initial_mass = self.initial_volume * cfg.density
         self.remaining_mass = self.initial_mass
-        self.obs_dim = self.num_points * 5
+        self.baseline_metrics: RatedConditionMetrics | None = None
+        self.current_metrics: RatedConditionMetrics | None = None
+        self.last_score = 0.0
+        self.best_score = -float("inf")
+        self.obs_dim = 0
         if self.stage is not None and self._UsdGeom is not None and self._Sdf is not None:
             try:
                 self._ensure_default_lights()
@@ -347,13 +353,39 @@ class CylinderPhysicsEnv:
         radial = torch.norm(self.points[:, :2], dim=1)
         radial_disp = radial - self.cfg.radius
         temp_norm = (self.temperature - self.cfg.ambient_temp) / max(self.cfg.max_temp - self.cfg.ambient_temp, 1.0)
+        ablation_norm = self.ablation_depth / max(self.cfg.feature_fail_ratio * self.cfg.radius, 1.0e-12)
+        metrics = self.current_metrics
+        if metrics is None:
+            global_obs = torch.zeros(6, dtype=torch.float32, device=self.device)
+        else:
+            life_ratio = 1.0
+            if self.baseline_metrics is not None:
+                life_ratio = metrics.lifetime_s / max(self.baseline_metrics.lifetime_s, 1.0e-9)
+            global_obs = torch.tensor(
+                [
+                    metrics.voltage_v / max(self.cfg.max_voltage, 1.0),
+                    metrics.initial_net_band_power_w / max(
+                        self.baseline_metrics.initial_net_band_power_w if self.baseline_metrics is not None else 1.0,
+                        1.0e-9,
+                    ),
+                    metrics.average_net_band_power_w / max(
+                        self.baseline_metrics.average_net_band_power_w if self.baseline_metrics is not None else 1.0,
+                        1.0e-9,
+                    ),
+                    metrics.max_temperature_k / max(self.cfg.max_temp, 1.0),
+                    life_ratio,
+                    metrics.view_factor_proxy,
+                ],
+                dtype=torch.float32,
+                device=self.device,
+            )
         obs = torch.cat(
             [
                 self.points.flatten(),
-                self.velocity.flatten(),
                 radial_disp.flatten(),
                 temp_norm.flatten(),
-                self.ablation_depth.flatten(),
+                ablation_norm.flatten(),
+                global_obs,
             ]
         )
         return obs.detach().cpu().numpy()
@@ -363,9 +395,7 @@ class CylinderPhysicsEnv:
         cp = self.cfg.cp_ref + self.cfg.cp_temp_coeff * delta
         k = torch.clamp(self.cfg.k_ref + self.cfg.k_temp_coeff * delta, min=20.0)
         rho_elec = self.cfg.rho_elec_ref * (1.0 + self.cfg.rho_elec_temp_coeff * delta)
-        emissivity = self.cfg.emissivity_low + (
-            self.cfg.emissivity_high - self.cfg.emissivity_low
-        ) * torch.sigmoid((temperature - self.cfg.emissivity_transition_temp) / 220.0)
+        emissivity = torch.full_like(temperature, float(self.cfg.band_emissivity))
         return cp, k, rho_elec, emissivity
 
     def _evaporation_flux_kg_m2_s(self, temperature: torch.Tensor) -> torch.Tensor:
@@ -413,6 +443,12 @@ class CylinderPhysicsEnv:
         )
         self.ablation_depth = torch.zeros(self.num_points, dtype=torch.float32, device=self.device)
         self.remaining_mass = self.initial_mass
+        self.current_metrics = self._evaluate_geometry()
+        self.baseline_metrics = self.current_metrics
+        self.last_score = self._score_metrics(self.current_metrics)
+        self.best_score = self.last_score
+        self._update_pointwise_fields_from_metrics(self.current_metrics)
+        self.obs_dim = int(self._build_observation().shape[0])
         self._sync_to_usd()
         return self._build_observation()
 
@@ -427,6 +463,9 @@ class CylinderPhysicsEnv:
             "ablation_depth": self.ablation_depth.clone(),
             "remaining_mass": float(self.remaining_mass),
             "current_step": self.current_step,
+            "current_metrics": self.current_metrics,
+            "last_score": float(self.last_score),
+            "best_score": float(self.best_score),
         }
 
     def set_state(self, state):
@@ -443,6 +482,9 @@ class CylinderPhysicsEnv:
         self.ablation_depth = state["ablation_depth"].clone()
         self.remaining_mass = float(state["remaining_mass"])
         self.current_step = int(state["current_step"])
+        self.current_metrics = state.get("current_metrics")
+        self.last_score = float(state.get("last_score", 0.0))
+        self.best_score = float(state.get("best_score", self.last_score))
         self._sync_to_usd()
 
     def evaluate_action(self, actions):
@@ -459,34 +501,176 @@ class CylinderPhysicsEnv:
             self._suppress_usd_sync = False
         return reward, done, info
 
-    def compute_free_energy(self, points: torch.Tensor, velocity: torch.Tensor) -> torch.Tensor:
+    def compute_free_energy(self, points: torch.Tensor, velocity: torch.Tensor | None = None) -> float:
         radial = torch.norm(points[:, :2], dim=1)
         radial_disp = radial - self.cfg.radius
-
-        # U_spring: isotropic radial restoring energy
         u_spring = 0.5 * self.cfg.k_spring * torch.sum(radial_disp.pow(2))
-
-        # U_bend: smoothness penalty from graph Laplacian
         lap = self._laplacian_term(radial_disp)
         u_bend = 0.5 * self.cfg.k_bend * torch.sum(lap.pow(2))
+        return float((u_spring + u_bend).item())
 
-        # Kinetic term
-        kinetic = 0.5 * self.cfg.mass_lumped * torch.sum(velocity.pow(2))
-
-        # Entropy proxy: variance of local displacement field
-        entropy = torch.var(radial_disp)
-
-        return (u_spring + u_bend + kinetic) - (self.cfg.ambient_temp * entropy)
+    def _ring_radius_profile(self, points: torch.Tensor | None = None) -> torch.Tensor:
+        pts = self.points if points is None else points
+        return ring_radii_from_points(pts, self.ring_index, self.cfg.num_rings)
 
     def _compute_volume(self, points: torch.Tensor) -> float:
-        radius = torch.norm(points[:, :2], dim=1).mean().item()
-        return math.pi * radius * radius * self.cfg.height
+        ring_radius = self._ring_radius_profile(points)
+        dz = self.cfg.height / max(self.cfg.num_rings - 1, 1)
+        area = math.pi * ring_radius.pow(2)
+        if area.numel() <= 1:
+            return float(area[0].item() * self.cfg.height)
+        axial_weight = torch.full_like(area, dz)
+        axial_weight[0] *= 0.5
+        axial_weight[-1] *= 0.5
+        return float(torch.sum(area * axial_weight).item())
 
     def _compute_feature_change_ratio(self, points: torch.Tensor) -> float:
-        radius_mean = torch.norm(points[:, :2], dim=1).mean()
-        radius_ratio = torch.abs(radius_mean - self.cfg.radius) / max(self.cfg.radius, 1e-12)
-        ablation_ratio = torch.max(self.ablation_depth) / max(self.cfg.radius, 1e-12)
-        return float(torch.max(radius_ratio, ablation_ratio).item())
+        ring_radius = self._ring_radius_profile(points)
+        radius_ratio = torch.max(torch.abs(ring_radius - self.cfg.radius) / max(self.cfg.radius, 1e-12))
+        return float(radius_ratio.item())
+
+    def _update_pointwise_fields_from_metrics(self, metrics: RatedConditionMetrics) -> None:
+        self.temperature = metrics.ring_temperature_k[self.ring_index].clone()
+        self.ablation_depth = (
+            metrics.ring_recession_rate_m_s[self.ring_index] * self.cfg.ablation_observation_horizon_s
+        ).clone()
+        self.remaining_mass = max(
+            self.initial_mass - metrics.mass_loss_rate_kg_s * self.cfg.ablation_observation_horizon_s,
+            0.0,
+        )
+
+    def _evaluate_geometry(self) -> RatedConditionMetrics:
+        ring_radius = self._ring_radius_profile(self.points)
+        return search_rated_condition(self.cfg, ring_radius, self.initial_volume)
+
+    def _score_metrics(self, metrics: RatedConditionMetrics) -> float:
+        baseline = self.baseline_metrics or metrics
+        initial_ratio = metrics.initial_net_band_power_w / max(baseline.initial_net_band_power_w, 1.0e-9)
+        average_ratio = metrics.average_net_band_power_w / max(baseline.average_net_band_power_w, 1.0e-9)
+        lifetime_ratio = metrics.lifetime_s / max(baseline.lifetime_s, 1.0e-9)
+        score = (
+            self.cfg.reward_weight_initial_power * initial_ratio
+            + self.cfg.reward_weight_average_power * average_ratio
+            + self.cfg.reward_weight_lifetime * lifetime_ratio
+            + self.cfg.reward_weight_uniformity * metrics.temperature_uniformity
+            + self.cfg.reward_weight_efficiency * metrics.band_efficiency
+        )
+        score -= self.cfg.reward_penalty_mass_loss * max(metrics.mass_loss_rate_kg_s - self.cfg.max_mass_loss_rate, 0.0)
+        score -= self.cfg.reward_penalty_temp_violation * max(metrics.max_temperature_k - self.cfg.max_temp, 0.0) ** 2
+        score -= self.cfg.reward_penalty_feature_violation * max(
+            metrics.feature_change_ratio - self.cfg.feature_fail_ratio,
+            0.0,
+        )
+        score -= self.cfg.reward_penalty_volume_change * metrics.volume_change_ratio
+        if lifetime_ratio < self.cfg.minimum_lifetime_ratio:
+            score -= 10.0 * (self.cfg.minimum_lifetime_ratio - lifetime_ratio)
+        if not metrics.feasible:
+            score -= 25.0
+        return float(score)
+
+    def _current_movable_mask(self) -> torch.Tensor:
+        if not self.cfg.keep_electrode_rings_fixed:
+            return torch.ones(self.num_points, dtype=torch.bool, device=self.device)
+        first_ring = self.ring_index == 0
+        last_ring = self.ring_index == int(torch.max(self.ring_index).item())
+        return ~(first_ring | last_ring)
+
+    def _enforce_volume_conservation(self, movable_mask: torch.Tensor) -> None:
+        current_volume = self._compute_volume(self.points)
+        missing_volume = self.initial_volume - current_volume
+        if abs(missing_volume) / max(self.initial_volume, 1.0e-12) < 1.0e-6:
+            return
+        correction = float(
+            np.clip(
+                missing_volume / max(self.area_per_point * float(torch.sum(movable_mask.float()).item()), 1.0e-12),
+                -0.25 * self.cfg.max_depth,
+                0.25 * self.cfg.max_depth,
+            )
+        )
+        xy = self.points[:, :2]
+        radial = torch.norm(xy, dim=1, keepdim=True).clamp_min(1.0e-9)
+        radial_dir = xy / radial
+        corrected_radius = torch.clamp(
+            radial.squeeze(1) + correction * movable_mask.float(),
+            min=self.cfg.min_radius,
+        )
+        self.points[:, :2] = radial_dir * corrected_radius.unsqueeze(1)
+
+    def _apply_design_action(self, target_idx: int, depth: float, sigma: float) -> None:
+        movable_mask = self._current_movable_mask()
+        distance = self._cylindrical_surface_distance(target_idx)
+        sigma = max(float(sigma), self.cfg.min_sigma)
+        local_profile = torch.exp(-0.5 * (distance / sigma).pow(2)) * movable_mask.float()
+        local_profile[target_idx] = 1.0 if movable_mask[target_idx] else 0.0
+        local_dent = -float(depth) * local_profile
+
+        compensation_mask = movable_mask & (distance > self.cfg.compensation_exclusion_sigma * sigma)
+        if not torch.any(compensation_mask):
+            compensation_mask = movable_mask.clone()
+            compensation_mask[target_idx] = False
+        compensation_weights = compensation_mask.float()
+        if self.current_metrics is not None:
+            temp_norm = torch.clamp(
+                (self.temperature - self.cfg.ambient_temp) / max(self.cfg.max_temp - self.cfg.ambient_temp, 1.0),
+                0.0,
+                1.0,
+            )
+            compensation_weights = compensation_weights * (
+                1.0 + self.cfg.compensation_cool_bias * (1.0 - temp_norm)
+            )
+        compensation_weights = compensation_weights * (1.0 + distance / max(float(torch.max(distance).item()), 1.0e-12))
+        if float(torch.sum(compensation_weights).item()) > 0.0:
+            compensation = (-torch.sum(local_dent) / torch.sum(compensation_weights)) * compensation_weights
+        else:
+            compensation = torch.zeros_like(local_dent)
+        radial_delta = torch.clamp(
+            local_dent + compensation,
+            min=-self.cfg.max_depth,
+            max=self.cfg.max_depth,
+        )
+
+        xy = self.points[:, :2]
+        radial = torch.norm(xy, dim=1, keepdim=True).clamp_min(1.0e-9)
+        radial_dir = xy / radial
+        new_radius = torch.clamp(radial.squeeze(1) + radial_delta, min=self.cfg.min_radius)
+        self.points[:, :2] = radial_dir * new_radius.unsqueeze(1)
+        self._enforce_volume_conservation(movable_mask)
+        self._apply_electrode_constraints()
+        updated_radial_disp = torch.norm(self.points[:, :2], dim=1) - self.cfg.radius
+        self.dent_field = torch.clamp(updated_radial_disp, max=0.0)
+        self.bulge_field = torch.clamp(updated_radial_disp, min=0.0)
+        self.velocity.zero_()
+
+    def _build_info(self, metrics: RatedConditionMetrics, score: float, reward: float, free_energy: float) -> Dict[str, float]:
+        return {
+            "score": float(score),
+            "reward_delta": float(reward),
+            "free_energy": float(free_energy),
+            "rated_voltage_v": float(metrics.voltage_v),
+            "mean_temp": float(metrics.mean_temperature_k),
+            "max_temp": float(metrics.max_temperature_k),
+            "radiation_power": float(metrics.initial_net_band_power_w),
+            "average_radiation_power": float(metrics.average_net_band_power_w),
+            "mass_loss_rate": float(metrics.mass_loss_rate_kg_s),
+            "remaining_mass": float(self.remaining_mass),
+            "volume_change_ratio": float(metrics.volume_change_ratio),
+            "feature_change_ratio": float(metrics.feature_change_ratio),
+            "current_a": float(metrics.current_a),
+            "circuit_resistance_ohm": float(metrics.resistance_ohm),
+            "band_efficiency": float(metrics.band_efficiency),
+            "temperature_uniformity": float(metrics.temperature_uniformity),
+            "lifetime_s": float(metrics.lifetime_s),
+            "lifetime_ratio": float(
+                metrics.lifetime_s / max((self.baseline_metrics or metrics).lifetime_s, 1.0e-9)
+            ),
+            "thermal_iterations": float(metrics.thermal_iterations),
+            "thermal_residual_k": float(metrics.thermal_residual_k),
+            "thermal_converged": float(1.0 if metrics.thermal_converged else 0.0),
+            "view_factor_proxy": float(metrics.view_factor_proxy),
+            "active_dent_points": float((torch.abs(self.dent_field) > self.cfg.dent_active_threshold).sum().item()),
+            "max_dent_depth": float(torch.abs(self.dent_field).max().item()),
+            "step": float(self.current_step),
+        }
 
     def step(self, actions):
         self.current_step += 1
@@ -499,203 +683,30 @@ class CylinderPhysicsEnv:
         idx_ratio = float(torch.clamp(a[0], 0.0, 1.0).item())
         depth = float(torch.clamp(a[1], 0.0, 1.0).item()) * self.cfg.max_depth
         sigma = float(torch.clamp(torch.abs(a[2]), self.cfg.min_sigma, self.cfg.max_sigma).item())
-
         target_idx = int(idx_ratio * (self.num_points - 1))
 
-        # Regular hemispherical dent profile on unwrapped cylinder surface.
-        # Use an N-gon footprint (N -> infinity approximates circular hemisphere domain).
-        theta = torch.atan2(self.points[:, 1], self.points[:, 0])
-        theta0 = theta[target_idx]
-        dtheta = torch.atan2(torch.sin(theta - theta0), torch.cos(theta - theta0))
-        du = self.cfg.radius * dtheta
-        dv = self.points[:, 2] - self.points[target_idx, 2]
-        dist = torch.sqrt(du * du + dv * dv)
-        radius = sigma
-
-        sides = int(max(getattr(self.cfg, "dent_polygon_sides", 256), 3))
-        phi = torch.atan2(dv, du)
-        sector = (2.0 * math.pi) / float(sides)
-        # Fold direction into one sector and compute direction-dependent boundary radius.
-        folded = torch.remainder(phi + math.pi, sector) - 0.5 * sector
-        apothem = radius * math.cos(math.pi / float(sides))
-        boundary = apothem / torch.clamp(torch.cos(folded), min=1e-6)
-        rho = dist / torch.clamp(boundary, min=1e-12)
-        inside = rho <= 1.0
-        hemi_core = torch.zeros(self.num_points, dtype=torch.float32, device=self.device)
-        hemi_core[inside] = torch.sqrt(
-            torch.clamp(1.0 - rho[inside].pow(2), min=0.0)
-        )
-
-        xy = self.points[:, :2]
-        radial_norm = torch.norm(xy, dim=1, keepdim=True).clamp_min(1e-6)
-        radial_dir = xy / radial_norm
-
-        # Local inward dent.
-        local_dent = -depth * hemi_core
-
-        # Volume conservation:
-        # Convert missing dent volume to a top-height compensation term.
-        # Desired relation: delta_h = dV / A0, where A0 is the original cylinder cross-section area.
-        missing_volume = -torch.sum(local_dent) * self.area_per_point
-        base_cross_area = math.pi * (self.cfg.radius ** 2)
-        delta_h = max(float(missing_volume.item()), 0.0) / max(base_cross_area, 1e-12)
-
-        # Persistent radial target only keeps dents (height compensation is axial).
-        self.dent_field = self.dent_field * (1.0 - self.cfg.dent_decay) + local_dent
-        self.dent_field = torch.clamp(self.dent_field, -self.cfg.max_total_dent, 0.0)
-
-        # External force follows local dent target.
-        f_ext_xy = radial_dir * local_dent.unsqueeze(1) * self.cfg.k_input
-        f_ext = torch.cat([f_ext_xy, torch.zeros(self.num_points, 1, device=self.device)], dim=1)
-
-        radial = torch.norm(self.points[:, :2], dim=1)
-        radial_disp = radial - self.cfg.radius
-        lap = self._laplacian_term(radial_disp)
-
-        # Restoring force is measured against accumulated dent target field.
-        radial_error = radial_disp - self.dent_field
-        f_spring_xy = -radial_dir * (self.cfg.k_spring * radial_error).unsqueeze(1)
-        f_bend_xy = -radial_dir * (self.cfg.k_bend * lap).unsqueeze(1)
-        f_internal = torch.cat([f_spring_xy + f_bend_xy, torch.zeros(self.num_points, 1, device=self.device)], dim=1)
-
-        # Damping + integration.
-        force_total = f_ext + f_internal - self.cfg.damping * self.velocity
-        acc = force_total / self.cfg.mass_lumped
-        self.velocity = self.velocity + acc * self.cfg.dt
-        self.points = self.points + self.velocity * self.cfg.dt
-        self._apply_shape_projection()
-
-        # Axial volume compensation:
-        # Add missing volume to cylinder height (top region), using original cross-section area.
-        if delta_h > 0.0:
-            if self.cfg.keep_electrode_rings_fixed:
-                first_ring = self.ring_index == 0
-                last_ring = self.ring_index == int(torch.max(self.ring_index).item())
-                movable = ~(first_ring | last_ring)
-            else:
-                movable = torch.ones(self.num_points, dtype=torch.bool, device=self.device)
-
-            if torch.any(movable):
-                ring_f = self.ring_index.float()
-                ring_min = torch.min(ring_f[movable])
-                ring_max = torch.max(ring_f[movable])
-                ring_span = torch.clamp(ring_max - ring_min, min=1.0)
-                # Compensation is concentrated toward upper region and reaches max at top.
-                z_weight = torch.clamp((ring_f - ring_min) / ring_span, 0.0, 1.0) * movable.float()
-                self.points[:, 2] = self.points[:, 2] + z_weight * delta_h
-
-        # Keep minimum radius to avoid collapsing through axis.
-        xy = self.points[:, :2]
-        r = torch.norm(xy, dim=1, keepdim=True).clamp_min(1e-6)
-        collapsed = r < self.cfg.min_radius
-        if collapsed.any():
-            self.points[:, :2] = torch.where(collapsed, xy / r * self.cfg.min_radius, xy)
-            self.velocity[:, :2] *= (~collapsed).float()
-
-        # --------------------- Electro-thermal + evaporation ---------------------
-        cp, k, rho_elec, emissivity = self._material_properties(self.temperature)
-        radius_now = torch.norm(self.points[:, :2], dim=1).clamp_min(self.cfg.min_radius)
-        mean_radius = torch.mean(radius_now)
-        cross_area = math.pi * float(mean_radius.item()) ** 2
-        internal_resistance = max(
-            float(torch.mean(rho_elec).item()) * self.cfg.height / max(cross_area, 1e-12),
-            self.cfg.min_resistance,
-        )
-        total_resistance = internal_resistance + float(getattr(self.cfg, "external_series_resistance", 0.0))
-        current_ideal = self.cfg.applied_voltage / max(total_resistance, self.cfg.min_resistance)
-        t_max_now = float(torch.max(self.temperature).item())
-        t0 = float(getattr(self.cfg, "current_derate_temp_start", self.cfg.max_temp * 0.75))
-        t1 = float(getattr(self.cfg, "current_derate_temp_end", self.cfg.max_temp * 0.98))
-        min_scale = float(getattr(self.cfg, "current_derate_min_scale", 0.15))
-        if t1 <= t0:
-            derate = 1.0
-        else:
-            ratio = np.clip((t_max_now - t0) / (t1 - t0), 0.0, 1.0)
-            derate = 1.0 - (1.0 - min_scale) * ratio
-        current = float(np.clip(current_ideal * derate, 0.0, self.cfg.max_current))
-        current_density = current / max(cross_area, 1e-12)
-
-        q_joule = (current_density**2) * rho_elec
-        temp_lap = self._laplacian_scalar(self.temperature)
-        sa_over_vol = self._surface_area_to_volume_ratio(radius_now)
-        q_rad = (
-            emissivity
-            * self.cfg.stefan_boltzmann
-            * getattr(self.cfg, "radiative_cooling_scale", 1.0)
-            * (
-            self.temperature.pow(4) - self.cfg.ambient_temp**4
-            )
-        )
-        q_conv = getattr(self.cfg, "convective_cooling_coeff", 0.0) * (
-            self.temperature - self.cfg.ambient_temp
-        )
-
-        evap_flux = self._evaporation_flux_kg_m2_s(self.temperature)
-        q_evap = evap_flux * self.cfg.latent_heat_evap
-        alpha = k / (self.cfg.density * cp)
-        dT_dt = (
-            q_joule / (self.cfg.density * cp)
-            + alpha * temp_lap / max(self.dx * self.dx, 1e-12)
-            - (q_rad + q_conv + q_evap) * sa_over_vol / (self.cfg.density * cp)
-        )
-        self.temperature = torch.clamp(
-            self.temperature + dT_dt * self.cfg.dt,
-            min=self.cfg.ambient_temp,
-            max=self.cfg.max_temp * 1.2,
-        )
-
-        dm_point = evap_flux * self.area_per_point * self.cfg.dt
-        dm_total = float(torch.sum(dm_point).item())
-        self.remaining_mass = max(self.remaining_mass - dm_total, 0.0)
-        thickness_loss = dm_point / (self.cfg.density * self.area_per_point + 1e-12)
-        self.ablation_depth = self.ablation_depth + thickness_loss
-        self.points[:, :2] = self.points[:, :2] - radial_dir * thickness_loss.unsqueeze(1)
-
-        self._apply_electrode_constraints()
+        previous_score = float(self.last_score)
+        self._apply_design_action(target_idx, depth, sigma)
+        metrics = self._evaluate_geometry()
+        self.current_metrics = metrics
+        self._update_pointwise_fields_from_metrics(metrics)
+        free_energy = self.compute_free_energy(self.points)
+        score = self._score_metrics(metrics) - self.cfg.reward_penalty_free_energy * free_energy
+        reward = score - previous_score
+        self.last_score = score
+        self.best_score = max(self.best_score, score)
 
         self._sync_to_usd()
 
-        # ------------------------------ Objective --------------------------------
-        free_energy = self.compute_free_energy(self.points, self.velocity)
-        current_volume = self._compute_volume(self.points)
-        volume_change_ratio = abs(current_volume - self.initial_volume) / max(self.initial_volume, 1e-12)
-        feature_change_ratio = self._compute_feature_change_ratio(self.points)
-        max_temp_violation = max(float(torch.max(self.temperature).item() - self.cfg.max_temp), 0.0)
-        mass_loss_rate = dm_total / max(self.cfg.dt, 1e-12)
-
-        q_rad_net = torch.sum(q_rad * self.area_per_point)
-        reward = (
-            self.cfg.reward_scale_radiation * float(q_rad_net.item())
-            - self.cfg.penalty_mass_loss * max(mass_loss_rate - self.cfg.max_mass_loss_rate, 0.0)
-            - self.cfg.penalty_temp_violation * (max_temp_violation**2)
-            - self.cfg.penalty_feature_violation * max(feature_change_ratio - self.cfg.feature_fail_ratio, 0.0)
-            - self.cfg.penalty_volume_change * volume_change_ratio
-            - 0.02 * float(free_energy.item())
-        )
-
-        fail_feature = feature_change_ratio >= self.cfg.feature_fail_ratio
-        fail_temp = torch.max(self.temperature).item() >= self.cfg.max_temp * 1.02
+        life_ratio = metrics.lifetime_s / max((self.baseline_metrics or metrics).lifetime_s, 1.0e-9)
+        fail_feature = metrics.feature_change_ratio >= self.cfg.feature_fail_ratio
+        fail_temp = metrics.max_temperature_k > self.cfg.max_temp
+        fail_volume = metrics.volume_change_ratio > self.cfg.volume_tolerance_ratio
+        fail_life = life_ratio < self.cfg.minimum_lifetime_ratio
         if getattr(self.cfg, "terminate_on_constraints", True):
-            done = self.current_step >= self.cfg.max_steps or fail_feature or fail_temp
+            done = self.current_step >= self.cfg.max_steps or fail_feature or fail_temp or fail_volume or fail_life
         else:
             done = self.current_step >= self.cfg.max_steps
-        info: Dict[str, float] = {
-            "free_energy": float(free_energy.item()),
-            "mean_radius": float(torch.norm(self.points[:, :2], dim=1).mean().item()),
-            "active_dent_points": float((torch.abs(self.dent_field) > self.cfg.dent_active_threshold).sum().item()),
-            "max_dent_depth": float(torch.abs(self.dent_field).max().item()),
-            "height_compensation_step": float(delta_h),
-            "shape_projection_alpha": float(getattr(self.cfg, "shape_projection_alpha", 0.0)),
-            "mean_temp": float(torch.mean(self.temperature).item()),
-            "max_temp": float(torch.max(self.temperature).item()),
-            "mass_loss_rate": float(mass_loss_rate),
-            "remaining_mass": float(self.remaining_mass),
-            "volume_change_ratio": float(volume_change_ratio),
-            "feature_change_ratio": float(feature_change_ratio),
-            "radiation_power": float(q_rad_net.item()),
-            "convective_power": float(torch.sum(q_conv * self.area_per_point).item()),
-            "current_a": float(current),
-            "circuit_resistance_ohm": float(total_resistance),
-            "step": float(self.current_step),
-        }
+
+        info = self._build_info(metrics, score, reward, free_energy)
         return self._build_observation(), reward, done, info

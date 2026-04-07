@@ -1,3 +1,6 @@
+# Legacy RL config kept for reference.
+# The current main entry `train.py` now runs an offline geometry-search loop
+# with rated-condition evaluation instead of PPO training.
 params:
   seed: 42
   algo:
