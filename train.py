@@ -54,19 +54,33 @@ def frame_viewport_on_prims(prim_paths):
 
 def pick_best_action(env: CylinderPhysicsEnv):
     """
-    Greedy one-step optimizer.
-    It searches candidate dent positions and amplitudes, then picks
-    the action that yields the lowest next-step free energy.
+    Greedy one-step optimizer with extended action types.
+
+    支持三种动作类型:
+    - 凹陷 (action_type=0): 减少局部半径，产生向内的凹陷
+    - 凸起 (action_type=1): 增加局部半径，产生向外的凸起
+    - 无操作 (action_type=2): 跳过几何变形，仅进行物理仿真
+
+    搜索策略: 对候选位置和动作类型组合进行评估，选择使自由能最小且满足约束的动作。
     """
     points = env.points
     radial = torch.norm(points[:, :2], dim=1)
     radial_disp = radial - env.cfg.radius
 
-    # Focus on outward bulges and thermal hotspots.
+    # Focus on outward bulges, inward dents, and thermal hotspots.
     candidate_k = min(env.cfg.search_top_k, env.num_points)
-    top_shape = torch.topk(radial_disp, k=candidate_k, largest=True).indices.tolist()
+
+    # 凹陷候选: 半径较小的区域
+    top_dent = torch.topk(-radial_disp, k=candidate_k, largest=True).indices.tolist()
+
+    # 凸起候选: 半径较大的区域
+    top_bulge = torch.topk(radial_disp, k=candidate_k, largest=True).indices.tolist()
+
+    # 热区候选: 温度较高的区域
     top_temp = torch.topk(env.temperature, k=candidate_k, largest=True).indices.tolist()
-    top_indices = list(dict.fromkeys(top_shape + top_temp))
+
+    # 合并所有候选
+    top_indices = list(dict.fromkeys(top_dent + top_bulge + top_temp))
 
     # Skip fixed electrode rings so deformation actions affect free surface.
     if env.cfg.keep_electrode_rings_fixed:
@@ -75,7 +89,7 @@ def pick_best_action(env: CylinderPhysicsEnv):
         top_indices = [i for i in top_indices if bool(movable_mask[i].item())]
 
     # If shell is already mostly non-bulged, still allow sparse global probing.
-    if float(radial_disp.max().item()) < 1e-4:
+    if float(radial_disp.max().item()) < 1e-4 and float((-radial_disp).max().item()) < 1e-4:
         coarse = np.linspace(0, env.num_points - 1, num=min(12, env.num_points), dtype=int).tolist()
         if env.cfg.keep_electrode_rings_fixed:
             ring_max = int(torch.max(env.ring_index).item())
@@ -94,6 +108,8 @@ def pick_best_action(env: CylinderPhysicsEnv):
 
     depth_grid = list(env.cfg.search_depth_grid)
     sigma_grid = list(env.cfg.search_sigma_grid)
+    # 动作类型: 0=凹陷, 1=凸起, 2=无操作
+    action_types = [0, 1, 2]
 
     best_action = None
     best_free_energy = float("inf")
@@ -109,30 +125,32 @@ def pick_best_action(env: CylinderPhysicsEnv):
 
     for idx in top_indices:
         idx_ratio = idx / max(1, env.num_points - 1)
-        for depth in depth_grid:
-            for sigma in sigma_grid:
-                action = np.array([idx_ratio, depth, sigma], dtype=np.float32)
-                reward, _, info = env.evaluate_action(action)
-                free_energy = float(info["free_energy"])
-                max_temp_next = float(info.get("max_temp", 0.0))
-                feasible = max_temp_next <= temp_limit
+        for action_type in action_types:
+            for depth in depth_grid:
+                for sigma in sigma_grid:
+                    # 新格式: [index_ratio, action_type, depth, sigma]
+                    action = np.array([idx_ratio, action_type, depth, sigma], dtype=np.float32)
+                    reward, _, info = env.evaluate_action(action)
+                    free_energy = float(info["free_energy"])
+                    max_temp_next = float(info.get("max_temp", 0.0))
+                    feasible = max_temp_next <= temp_limit
 
-                # Hard temperature filter: prefer actions that keep next-step temperature under limit.
-                if feasible and float(reward) > best_feasible_reward:
-                    best_feasible_reward = float(reward)
-                    best_feasible_free_energy = free_energy
-                    best_feasible_action = action
+                    # Hard temperature filter: prefer actions that keep next-step temperature under limit.
+                    if feasible and float(reward) > best_feasible_reward:
+                        best_feasible_reward = float(reward)
+                        best_feasible_free_energy = free_energy
+                        best_feasible_action = action
 
-                if max_temp_next < coolest_next_temp:
-                    coolest_next_temp = max_temp_next
-                    coolest_action = action
-                    coolest_reward = float(reward)
-                    coolest_free_energy = free_energy
+                    if max_temp_next < coolest_next_temp:
+                        coolest_next_temp = max_temp_next
+                        coolest_action = action
+                        coolest_reward = float(reward)
+                        coolest_free_energy = free_energy
 
-                if float(reward) > best_reward:
-                    best_free_energy = free_energy
-                    best_reward = float(reward)
-                    best_action = action
+                    if float(reward) > best_reward:
+                        best_free_energy = free_energy
+                        best_reward = float(reward)
+                        best_action = action
 
     if best_feasible_action is not None:
         return best_feasible_action, best_feasible_reward, best_feasible_free_energy
@@ -141,7 +159,8 @@ def pick_best_action(env: CylinderPhysicsEnv):
         return coolest_action, coolest_reward, coolest_free_energy
 
     if best_action is None:
-        best_action = np.array([0.0, 0.0, env.cfg.min_sigma], dtype=np.float32)
+        # 默认: 无操作
+        best_action = np.array([0.0, 2.0, 0.0, env.cfg.min_sigma], dtype=np.float32)
     return best_action, best_reward, best_free_energy
 
 
@@ -239,6 +258,12 @@ def run_simulation(
                 "volume_change_ratio": float(info["volume_change_ratio"]),
                 "active_dent_points": int(info["active_dent_points"]),
                 "max_dent_depth": float(info["max_dent_depth"]),
+                "active_bulge_points": int(info.get("active_bulge_points", 0)),
+                "max_bulge_height": float(info.get("max_bulge_height", 0.0)),
+                # 寿命相关指标
+                "remaining_lifetime": float(info.get("remaining_lifetime", 0.0)),
+                "initial_lifetime": float(info.get("initial_lifetime", 0.0)),
+                "lifetime_ratio": float(info.get("lifetime_ratio", 0.0)),
             }
         )
         if (step_idx + 1) % cfg.log_interval == 0 or step_idx == 0:
@@ -249,7 +274,9 @@ def run_simulation(
                 f"Tmax={info['max_temp']:.1f}K, "
                 f"Prad={info['radiation_power']:.4f}W, "
                 f"I={info.get('current_a', 0.0):.1f}A, "
+                f"lifetime_ratio={info.get('lifetime_ratio', 0.0):.2f}, "
                 f"active_dents={int(info['active_dent_points'])}, "
+                f"active_bulges={int(info.get('active_bulge_points', 0))}, "
                 f"max_dent={info['max_dent_depth']:.4f}",
                 flush=True,
             )

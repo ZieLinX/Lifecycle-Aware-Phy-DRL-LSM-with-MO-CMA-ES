@@ -359,23 +359,214 @@ class CylinderPhysicsEnv:
         return obs.detach().cpu().numpy()
 
     def _material_properties(self, temperature: torch.Tensor):
+        """
+        计算材料物性参数随温度的变化
+
+        热导率: k(T) = k_ref + k_temp_coeff * (T - 300)
+        比热容: cp(T) = cp_ref + cp_temp_coeff * (T - 300)
+        电阻率: 分段线性 - 低温段和高温段使用不同温度系数
+        发射率: 使用赛题规定的简化等效发射率模型
+        """
         delta = torch.clamp(temperature - 300.0, min=0.0)
+
+        # 热导率 [W/(m·K)]
+        k = torch.clamp(
+            self.cfg.k_ref + self.cfg.k_temp_coeff * delta,
+            min=20.0,
+            max=250.0
+        )
+
+        # 比热容 [J/(kg·K)]
         cp = self.cfg.cp_ref + self.cfg.cp_temp_coeff * delta
-        k = torch.clamp(self.cfg.k_ref + self.cfg.k_temp_coeff * delta, min=20.0)
-        rho_elec = self.cfg.rho_elec_ref * (1.0 + self.cfg.rho_elec_temp_coeff * delta)
-        emissivity = self.cfg.emissivity_low + (
-            self.cfg.emissivity_high - self.cfg.emissivity_low
-        ) * torch.sigmoid((temperature - self.cfg.emissivity_transition_temp) / 220.0)
+
+        # 电阻率 [Ω·m] - 分段线性模型
+        # 低温段 (T < rho_elec_transition_temp): 使用低温度系数
+        # 高温段 (T >= rho_elec_transition_temp): 使用高温度系数
+        T_trans = self.cfg.rho_elec_transition_temp
+        coeff_low = self.cfg.rho_elec_temp_coeff_low
+        coeff_high = self.cfg.rho_elec_temp_coeff_high
+
+        # 创建温度依赖的温度系数
+        coeff = torch.where(
+            temperature < T_trans,
+            torch.full_like(temperature, coeff_low),
+            torch.full_like(temperature, coeff_high)
+        )
+        rho_elec = self.cfg.rho_elec_ref * (1.0 + coeff * delta)
+
+        # 发射率 - 赛题规定的简化模型
+        # 使用等效平均发射率 (考虑0-3μm波段辐射占比)
+        emissivity = torch.full_like(temperature, self.cfg.emissivity_effective)
+
         return cp, k, rho_elec, emissivity
 
     def _evaporation_flux_kg_m2_s(self, temperature: torch.Tensor) -> torch.Tensor:
-        # Input law in g/(cm^2*s); convert to kg/(m^2*s) by factor 10.
-        y_g_cm2_s = self.cfg.evap_A * torch.exp(self.cfg.evap_B / torch.clamp(temperature, min=1.0))
+        """
+        计算蒸发率 [kg/(m²·s)]
+
+        赛题公式: γₑ = A·exp(-B/T) [g/(cm²·s)]
+        - A = 3.9×10⁸ g/(cm²·s)
+        - B = 1.023×10⁵ K
+        转换因子: 1 g/(cm²·s) = 10 kg/(m²·s)
+
+        注意: B为正值时，温度升高导致exp(-B/T)增大，符合"温度越高蒸发越快"的物理规律
+        """
+        y_g_cm2_s = self.cfg.evap_A * torch.exp(-self.cfg.evap_B / torch.clamp(temperature, min=1.0))
         return y_g_cm2_s * 10.0
 
     def _surface_area_to_volume_ratio(self, radius: torch.Tensor) -> torch.Tensor:
         r = torch.clamp(radius, min=self.cfg.min_radius)
         return 2.0 / r
+
+    def _compute_radiation_with_occlusion(self, points: torch.Tensor, temperature: torch.Tensor, emissivity: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        计算辐射散热，考虑几何自遮挡效应
+
+        简化遮挡模型：
+        1. 对于每个表面点，计算其相对于外接球的有效发射因子
+        2. 凹陷区域（局部凹点）的有效发射面积被周围表面遮挡
+        3. 使用基于曲率的遮挡估计：负曲率（凹陷）区域降低有效辐射
+
+        返回:
+        - q_rad: 每个点的辐射散热功率 [W/m²]
+        - occlusion_factor: 每个点的遮挡因子 [0, 1]
+        """
+        n_points = points.shape[0]
+
+        # 计算每个点的法向量（近似：通过邻域平面拟合）
+        xy = points[:, :2]
+        radial = torch.norm(xy, dim=1)
+        # 圆柱表面的法向量方向为径向（指向外部）
+        radial_norm = torch.clamp(radial, min=1e-6).unsqueeze(1)
+        normal = torch.cat([xy / radial_norm, torch.zeros(n_points, 1, device=self.device)], dim=1)
+
+        # 计算局部曲率：使用Laplacian估计
+        # 正值表示凸起（增大辐射），负值表示凹陷（减小辐射）
+        radial_disp = radial - self.cfg.radius
+        lap_curvature = self._laplacian_scalar(radial_disp)
+
+        # 基于曲率的遮挡因子
+        # 曲率为负（凹陷）时，遮挡因子减小
+        # 使用sigmoid函数平滑过渡
+        curvature_threshold = 0.0
+        curvature_scale = 50.0  # 调整灵敏度
+        occlusion_factor = torch.sigmoid((lap_curvature - curvature_threshold) * curvature_scale)
+        occlusion_factor = torch.clamp(occlusion_factor, min=0.3, max=1.0)  # 最小遮挡30%
+
+        # 计算辐射散热
+        # Stefan-Boltzmann定律: q = ε·σ·(T⁴ - T_ambient⁴)
+        T_ambient = self.cfg.ambient_temp
+        q_rad = (
+            emissivity
+            * self.cfg.stefan_boltzmann
+            * occlusion_factor  # 考虑遮挡
+            * (temperature.pow(4) - T_ambient**4)
+        )
+
+        # 计算总辐射功率
+        total_power = torch.sum(q_rad * self.area_per_point)
+
+        return q_rad, occlusion_factor
+
+    def _compute_feature_scales(self, points: torch.Tensor) -> Dict[str, float]:
+        """
+        计算多个特征尺度，用于判断器件失效
+
+        赛题规定: 当任意特征尺度变化率 [Li(t)-Li(0)]/Li(0) >= 20% 时认为器件失效
+
+        特征尺度定义:
+        - mean_radius: 平均半径
+        - max_radius: 最大局部半径
+        - min_radius: 最小局部半径
+        - height: 总高度
+        - surface_area: 估算表面积
+        """
+        xy = points[:, :2]
+        radii = torch.norm(xy, dim=1)
+
+        feature_scales = {
+            "mean_radius": float(torch.mean(radii).item()),
+            "max_radius": float(torch.max(radii).item()),
+            "min_radius": float(torch.min(radii).item()),
+            "height": float(torch.max(points[:, 2]) - torch.min(points[:, 2]).item()),
+            "surface_area": float(self.num_points * self.area_per_point),  # 简化估计
+        }
+
+        return feature_scales
+
+    def _compute_lifetime(self, current_state: Dict) -> float:
+        """
+        估算器件剩余寿命
+
+        基于当前蒸发率和特征尺度退化率，预测器件达到失效阈值的时间
+
+        返回: 预估剩余寿命 [秒]，如果已经失效返回0
+        """
+        # 特征尺度变化率
+        feature_ratio = self._compute_feature_change_ratio(self.points)
+
+        # 如果已经失效，返回0
+        if feature_ratio >= self.cfg.feature_fail_ratio:
+            return 0.0
+
+        # 基于当前蒸发率和质量损失速率，估算特征尺度退化时间
+        # 简化模型：假设特征尺度变化与质量损失成比例
+        mass_remaining = self.remaining_mass
+        mass_fraction = mass_remaining / max(self.initial_mass, 1e-12)
+
+        # 基于质量损失估算寿命
+        # 假设特征尺度变化与质量损失有某种对应关系
+        # 当质量损失达到某阈值时，特征尺度变化达到20%
+        mass_loss_for_failure = self.initial_mass * self.cfg.feature_fail_ratio
+        mass_lost = self.initial_mass - mass_remaining
+
+        if mass_lost >= mass_loss_for_failure:
+            return 0.0
+
+        # 估算当前质量损失速率
+        if hasattr(self, '_last_mass_loss_rate'):
+            current_rate = self._last_mass_loss_rate
+        else:
+            current_rate = 1e-9  # 假设初始损失速率
+
+        if current_rate > 1e-12:
+            remaining_mass_for_failure = mass_loss_for_failure - mass_lost
+            remaining_lifetime = remaining_mass_for_failure / current_rate
+        else:
+            remaining_lifetime = 1e6  # 假设极大寿命
+
+        return float(remaining_lifetime)
+
+    def _estimate_initial_lifetime(self) -> float:
+        """
+        估算初始形状的器件寿命
+
+        用于计算优化后寿命与初始寿命的比值（赛题要求: 优化后寿命 >= 初始寿命的30%）
+        """
+        # 初始形状的特征尺度
+        initial_radii = self.cfg.radius
+        initial_volume = self.initial_volume
+
+        # 使用初始温度场估算蒸发率
+        initial_temp = self.cfg.ambient_temp + 100.0  # 假设初始温升100K
+        evap_flux = self.cfg.evap_A * math.exp(-self.cfg.evap_B / initial_temp) * 10.0  # kg/(m²·s)
+        initial_area = 2 * math.pi * self.cfg.radius * self.cfg.height
+        initial_mass_loss_rate = evap_flux * initial_area
+
+        # 假设特征尺度变化与质量损失线性相关
+        # 20%特征尺度变化对应约15%的质量损失
+        mass_loss_for_failure = self.initial_mass * 0.15
+
+        if initial_mass_loss_rate > 1e-12:
+            return mass_loss_for_failure / initial_mass_loss_rate
+        else:
+            return 1e6  # 极大寿命
+
+    def initialize_lifetime_tracking(self):
+        """初始化寿命跟踪相关变量"""
+        self.initial_lifetime = self._estimate_initial_lifetime()
+        self.lifetime_history = []
+        self._last_mass_loss_rate = 1e-9
 
     def _apply_electrode_constraints(self):
         if not self.cfg.keep_electrode_rings_fixed:
@@ -413,6 +604,10 @@ class CylinderPhysicsEnv:
         )
         self.ablation_depth = torch.zeros(self.num_points, dtype=torch.float32, device=self.device)
         self.remaining_mass = self.initial_mass
+
+        # 初始化寿命跟踪
+        self.initialize_lifetime_tracking()
+
         self._sync_to_usd()
         return self._build_observation()
 
@@ -493,70 +688,114 @@ class CylinderPhysicsEnv:
         self._sync_from_usd()
 
         a = torch.as_tensor(actions, dtype=torch.float32, device=self.device).flatten()
-        if a.numel() < 3:
-            raise ValueError("actions must contain [index_ratio, indentation, sigma]")
 
-        idx_ratio = float(torch.clamp(a[0], 0.0, 1.0).item())
-        depth = float(torch.clamp(a[1], 0.0, 1.0).item()) * self.cfg.max_depth
-        sigma = float(torch.clamp(torch.abs(a[2]), self.cfg.min_sigma, self.cfg.max_sigma).item())
+        # 支持两种动作格式:
+        # 格式1: [index_ratio, depth, sigma] - 保持向后兼容（仅凹陷）
+        # 格式2: [index_ratio, action_type, depth, sigma] - 新格式（凹陷/凸起）
+        if a.numel() >= 4:
+            # 新格式: [index_ratio, action_type, depth, sigma]
+            idx_ratio = float(torch.clamp(a[0], 0.0, 1.0).item())
+            action_type = int(torch.clamp(a[1], 0.0, 2.0).item())  # 0=凹陷, 1=凸起, 2=无操作
+            depth = float(torch.clamp(a[2], 0.0, 1.0).item())
+            sigma = float(torch.clamp(torch.abs(a[3]), self.cfg.min_sigma, self.cfg.max_sigma).item())
+        elif a.numel() >= 3:
+            # 旧格式: [index_ratio, depth, sigma] (仅凹陷)
+            idx_ratio = float(torch.clamp(a[0], 0.0, 1.0).item())
+            action_type = 0  # 默认凹陷
+            depth = float(torch.clamp(a[1], 0.0, 1.0).item())
+            sigma = float(torch.clamp(torch.abs(a[2]), self.cfg.min_sigma, self.cfg.max_sigma).item())
+        else:
+            raise ValueError("actions must contain at least [index_ratio, depth, sigma]")
 
         target_idx = int(idx_ratio * (self.num_points - 1))
 
-        # Regular hemispherical dent profile on unwrapped cylinder surface.
-        # Use an N-gon footprint (N -> infinity approximates circular hemisphere domain).
-        theta = torch.atan2(self.points[:, 1], self.points[:, 0])
-        theta0 = theta[target_idx]
-        dtheta = torch.atan2(torch.sin(theta - theta0), torch.cos(theta - theta0))
-        du = self.cfg.radius * dtheta
-        dv = self.points[:, 2] - self.points[target_idx, 2]
-        dist = torch.sqrt(du * du + dv * dv)
-        radius = sigma
+        # 如果是无操作类型，直接跳过几何变形
+        if action_type == 2:
+            # 无操作，跳过变形但继续物理仿真
+            local_dent = torch.zeros(self.num_points, dtype=torch.float32, device=self.device)
+            local_bulge = torch.zeros(self.num_points, dtype=torch.float32, device=self.device)
+            delta_h = 0.0
+        else:
+            # 计算凹陷/凸起场
+            # Regular hemispherical profile on unwrapped cylinder surface.
+            # Use an N-gon footprint (N -> infinity approximates circular hemisphere domain).
+            theta = torch.atan2(self.points[:, 1], self.points[:, 0])
+            theta0 = theta[target_idx]
+            dtheta = torch.atan2(torch.sin(theta - theta0), torch.cos(theta - theta0))
+            du = self.cfg.radius * dtheta
+            dv = self.points[:, 2] - self.points[target_idx, 2]
+            dist = torch.sqrt(du * du + dv * dv)
+            radius = sigma
 
-        sides = int(max(getattr(self.cfg, "dent_polygon_sides", 256), 3))
-        phi = torch.atan2(dv, du)
-        sector = (2.0 * math.pi) / float(sides)
-        # Fold direction into one sector and compute direction-dependent boundary radius.
-        folded = torch.remainder(phi + math.pi, sector) - 0.5 * sector
-        apothem = radius * math.cos(math.pi / float(sides))
-        boundary = apothem / torch.clamp(torch.cos(folded), min=1e-6)
-        rho = dist / torch.clamp(boundary, min=1e-12)
-        inside = rho <= 1.0
-        hemi_core = torch.zeros(self.num_points, dtype=torch.float32, device=self.device)
-        hemi_core[inside] = torch.sqrt(
-            torch.clamp(1.0 - rho[inside].pow(2), min=0.0)
-        )
+            sides = int(max(getattr(self.cfg, "dent_polygon_sides", 256), 3))
+            phi = torch.atan2(dv, du)
+            sector = (2.0 * math.pi) / float(sides)
+            # Fold direction into one sector and compute direction-dependent boundary radius.
+            folded = torch.remainder(phi + math.pi, sector) - 0.5 * sector
+            apothem = radius * math.cos(math.pi / float(sides))
+            boundary = apothem / torch.clamp(torch.cos(folded), min=1e-6)
+            rho = dist / torch.clamp(boundary, min=1e-12)
+            inside = rho <= 1.0
+            hemi_core = torch.zeros(self.num_points, dtype=torch.float32, device=self.device)
+            hemi_core[inside] = torch.sqrt(
+                torch.clamp(1.0 - rho[inside].pow(2), min=0.0)
+            )
 
-        xy = self.points[:, :2]
-        radial_norm = torch.norm(xy, dim=1, keepdim=True).clamp_min(1e-6)
-        radial_dir = xy / radial_norm
+            xy = self.points[:, :2]
+            radial_norm = torch.norm(xy, dim=1, keepdim=True).clamp_min(1e-6)
+            radial_dir = xy / radial_norm
 
-        # Local inward dent.
-        local_dent = -depth * hemi_core
+            # 根据动作类型计算变形
+            if action_type == 0:
+                # 凹陷（减材）：向内变形
+                depth_value = depth * self.cfg.max_depth
+                local_dent = -depth_value * hemi_core
+                local_bulge = torch.zeros(self.num_points, dtype=torch.float32, device=self.device)
+            else:
+                # 凸起（增材）：向外变形
+                depth_value = depth * getattr(self.cfg, 'max_bulge', self.cfg.max_depth)
+                local_dent = torch.zeros(self.num_points, dtype=torch.float32, device=self.device)
+                local_bulge = depth_value * hemi_core
 
-        # Volume conservation:
-        # Convert missing dent volume to a top-height compensation term.
-        # Desired relation: delta_h = dV / A0, where A0 is the original cylinder cross-section area.
-        missing_volume = -torch.sum(local_dent) * self.area_per_point
-        base_cross_area = math.pi * (self.cfg.radius ** 2)
-        delta_h = max(float(missing_volume.item()), 0.0) / max(base_cross_area, 1e-12)
+            # 计算体积变化
+            dent_volume = -torch.sum(local_dent) * self.area_per_point
+            bulge_volume = torch.sum(local_bulge) * self.area_per_point
+            net_volume_change = bulge_volume - dent_volume
 
-        # Persistent radial target only keeps dents (height compensation is axial).
-        self.dent_field = self.dent_field * (1.0 - self.cfg.dent_decay) + local_dent
-        self.dent_field = torch.clamp(self.dent_field, -self.cfg.max_total_dent, 0.0)
+            # 体积守恒：将体积变化转换为高度补偿
+            base_cross_area = math.pi * (self.cfg.radius ** 2)
+            delta_h = net_volume_change / max(base_cross_area, 1e-12)
 
-        # External force follows local dent target.
-        f_ext_xy = radial_dir * local_dent.unsqueeze(1) * self.cfg.k_input
-        f_ext = torch.cat([f_ext_xy, torch.zeros(self.num_points, 1, device=self.device)], dim=1)
+            # 更新变形场
+            self.dent_field = self.dent_field * (1.0 - self.cfg.dent_decay) + local_dent
+            self.dent_field = torch.clamp(self.dent_field, -self.cfg.max_total_dent, 0.0)
 
+            self.bulge_field = self.bulge_field * (1.0 - getattr(self.cfg, 'bulge_decay', self.cfg.dent_decay)) + local_bulge
+            self.bulge_field = torch.clamp(self.bulge_field, 0.0, self.cfg.max_total_bulge)
+
+        # 计算外力
         radial = torch.norm(self.points[:, :2], dim=1)
         radial_disp = radial - self.cfg.radius
         lap = self._laplacian_term(radial_disp)
 
-        # Restoring force is measured against accumulated dent target field.
-        radial_error = radial_disp - self.dent_field
+        # 总变形场 = 凹陷 + 凸起
+        total_deform = self.dent_field + self.bulge_field
+
+        # 恢复力相对于总变形场
+        radial_error = radial_disp - total_deform
         f_spring_xy = -radial_dir * (self.cfg.k_spring * radial_error).unsqueeze(1)
         f_bend_xy = -radial_dir * (self.cfg.k_bend * lap).unsqueeze(1)
+
+        # 外力由凹陷和凸起共同决定
+        if action_type == 2:
+            f_ext_xy = torch.zeros(self.num_points, device=self.device)
+        elif action_type == 0:
+            f_ext_xy = (radial_dir * local_dent.unsqueeze(1) * self.cfg.k_input).squeeze(-1)
+        else:
+            f_ext_xy = (radial_dir * local_bulge.unsqueeze(1) * self.cfg.k_input).squeeze(-1)
+
         f_internal = torch.cat([f_spring_xy + f_bend_xy, torch.zeros(self.num_points, 1, device=self.device)], dim=1)
+        f_ext = torch.cat([f_ext_xy.unsqueeze(-1) if f_ext_xy.dim() == 1 else f_ext_xy, torch.zeros(self.num_points, 1, device=self.device)], dim=1)
 
         # Damping + integration.
         force_total = f_ext + f_internal - self.cfg.damping * self.velocity
@@ -567,7 +806,7 @@ class CylinderPhysicsEnv:
 
         # Axial volume compensation:
         # Add missing volume to cylinder height (top region), using original cross-section area.
-        if delta_h > 0.0:
+        if abs(delta_h) > 1e-10:
             if self.cfg.keep_electrode_rings_fixed:
                 first_ring = self.ring_index == 0
                 last_ring = self.ring_index == int(torch.max(self.ring_index).item())
@@ -632,6 +871,12 @@ class CylinderPhysicsEnv:
 
         evap_flux = self._evaporation_flux_kg_m2_s(self.temperature)
         q_evap = evap_flux * self.cfg.latent_heat_evap
+
+        # 使用带遮挡的辐射计算
+        q_rad, occlusion_factor = self._compute_radiation_with_occlusion(
+            self.points, self.temperature, emissivity
+        )
+
         alpha = k / (self.cfg.density * cp)
         dT_dt = (
             q_joule / (self.cfg.density * cp)
@@ -651,6 +896,9 @@ class CylinderPhysicsEnv:
         self.ablation_depth = self.ablation_depth + thickness_loss
         self.points[:, :2] = self.points[:, :2] - radial_dir * thickness_loss.unsqueeze(1)
 
+        # 更新质量损失速率跟踪
+        self._last_mass_loss_rate = dm_total / max(self.cfg.dt, 1e-12)
+
         self._apply_electrode_constraints()
 
         self._sync_to_usd()
@@ -664,8 +912,24 @@ class CylinderPhysicsEnv:
         mass_loss_rate = dm_total / max(self.cfg.dt, 1e-12)
 
         q_rad_net = torch.sum(q_rad * self.area_per_point)
+
+        # 计算寿命相关指标
+        remaining_lifetime = self._compute_lifetime({})
+
+        # 奖励函数：包含辐射功率和寿命奖励
+        lifetime_reward = 0.0
+        if hasattr(self, 'initial_lifetime') and self.initial_lifetime > 0:
+            lifetime_ratio = remaining_lifetime / self.initial_lifetime
+            # 赛题要求: 优化后寿命 >= 初始寿命的30%
+            if lifetime_ratio >= 0.3:
+                lifetime_reward = self.cfg.reward_scale_lifetime * lifetime_ratio
+            else:
+                # 寿命不足30%的惩罚
+                lifetime_reward = -10.0 * (0.3 - lifetime_ratio)
+
         reward = (
             self.cfg.reward_scale_radiation * float(q_rad_net.item())
+            + lifetime_reward
             - self.cfg.penalty_mass_loss * max(mass_loss_rate - self.cfg.max_mass_loss_rate, 0.0)
             - self.cfg.penalty_temp_violation * (max_temp_violation**2)
             - self.cfg.penalty_feature_violation * max(feature_change_ratio - self.cfg.feature_fail_ratio, 0.0)
@@ -675,15 +939,24 @@ class CylinderPhysicsEnv:
 
         fail_feature = feature_change_ratio >= self.cfg.feature_fail_ratio
         fail_temp = torch.max(self.temperature).item() >= self.cfg.max_temp * 1.02
+        fail_lifetime = hasattr(self, 'initial_lifetime') and self.initial_lifetime > 0 and remaining_lifetime / self.initial_lifetime < 0.3
+
         if getattr(self.cfg, "terminate_on_constraints", True):
-            done = self.current_step >= self.cfg.max_steps or fail_feature or fail_temp
+            done = self.current_step >= self.cfg.max_steps or fail_feature or fail_temp or fail_lifetime
         else:
             done = self.current_step >= self.cfg.max_steps
+
+        # 记录寿命历史
+        if hasattr(self, 'lifetime_history'):
+            self.lifetime_history.append(remaining_lifetime)
+
         info: Dict[str, float] = {
             "free_energy": float(free_energy.item()),
             "mean_radius": float(torch.norm(self.points[:, :2], dim=1).mean().item()),
             "active_dent_points": float((torch.abs(self.dent_field) > self.cfg.dent_active_threshold).sum().item()),
             "max_dent_depth": float(torch.abs(self.dent_field).max().item()),
+            "active_bulge_points": float((torch.abs(self.bulge_field) > self.cfg.dent_active_threshold).sum().item()),
+            "max_bulge_height": float(torch.abs(self.bulge_field).max().item()),
             "height_compensation_step": float(delta_h),
             "shape_projection_alpha": float(getattr(self.cfg, "shape_projection_alpha", 0.0)),
             "mean_temp": float(torch.mean(self.temperature).item()),
@@ -697,5 +970,9 @@ class CylinderPhysicsEnv:
             "current_a": float(current),
             "circuit_resistance_ohm": float(total_resistance),
             "step": float(self.current_step),
+            # 新增：寿命相关指标
+            "remaining_lifetime": float(remaining_lifetime),
+            "initial_lifetime": float(getattr(self, 'initial_lifetime', 0.0)),
+            "lifetime_ratio": float(remaining_lifetime / max(getattr(self, 'initial_lifetime', 1.0), 1e-12)),
         }
         return self._build_observation(), reward, done, info
