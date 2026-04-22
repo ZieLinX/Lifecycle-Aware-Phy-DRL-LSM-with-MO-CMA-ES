@@ -6,7 +6,7 @@ import argparse
 import importlib
 
 import numpy as np
-from config.cylinder_cfg import CylinderPhysicsCfg
+from config.cylinder_cfg import make_training_cfg
 from envs.cylinder_env import CylinderPhysicsEnv
 from utils.exporter import export_env_mesh
 from utils.planner import plan_action
@@ -84,7 +84,7 @@ def run_simulation(
         except Exception as exc:
             print(f"[viewer] Render settings override skipped: {exc}", flush=True)
 
-    cfg = CylinderPhysicsCfg()
+    cfg = make_training_cfg()
     if max_steps_override is not None:
         cfg.max_steps = int(max_steps_override)
     if fast_smoke:

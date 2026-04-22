@@ -11,6 +11,7 @@ class CylinderPhysicsCfg:
     viewer_scale = 400.0
     viewer_lift_z = 0.5
     viewer_subdivision_scheme = "catmullClark"
+    grid_mode = "training"
 
     # Design loop: one step = one offline geometry edit + one full evaluation.
     dt = 1.0
@@ -26,6 +27,8 @@ class CylinderPhysicsCfg:
     num_segments = 96
     num_rings = 48
     keep_electrode_rings_fixed = True
+    eval_num_segments = 160
+    eval_num_rings = 151
 
     # Material constants (pure tungsten)
     density = 19350.0
@@ -45,12 +48,14 @@ class CylinderPhysicsCfg:
     voltage_focus_ratio = 0.18
     min_resistance = 1e-6
     max_current = 5.0e3
-    external_series_resistance = 0.08
+    # Q23: the rated voltage is applied across tungsten only.
+    external_series_resistance = 0.0
 
     # Thermal / radiative environment
     ambient_temp = 300.0
     max_temp = 3273.15
     stefan_boltzmann = 5.670374419e-8
+    thermal_boundary_mode = "fixed_room_temp"
     # Ignore emissivity-temperature coupling as required by the statement.
     # Use fixed spectral emissivity: 0-3 um -> 0.35, other bands -> 0.15.
     band_emissivity = 0.35
@@ -77,6 +82,9 @@ class CylinderPhysicsCfg:
     shadow_roughness_coeff = 0.12
     lifecycle_reference_s = 3600.0
     ablation_observation_horizon_s = 600.0
+    transient_dt_s = 0.5
+    transient_max_time_s = 120.0
+    transient_default_voltage_ratio = 1.0
 
     # Mechanics / shape control
     mass_lumped = 0.02
@@ -103,6 +111,20 @@ class CylinderPhysicsCfg:
     minimum_lifetime_ratio = 0.30
     volume_tolerance_ratio = 0.02
     max_mass_loss_rate = 1.5e-6
+    feature_scale_mode = "equivalent_diameter"
+    feature_reference_diameter_m = 5.0e-3
+    min_neck_diameter_m = 1.6e-3
+    feasibility_area_ratio_min = 0.20
+    feasibility_area_ratio_max = 5.0
+    feasibility_max_slope = 0.35
+    reward_penalty_feasibility = 10.0
+    rated_penalty_feasibility = 25.0
+    enable_thermomech = True
+    thermo_youngs_modulus_pa = 4.0e11
+    thermo_expansion_coeff_per_k = 4.5e-6
+    thermo_reference_temp_k = 300.0
+    thermo_soft_yield_pa = 2.0e8
+    reward_weight_thermomech = 0.15
 
     # Objective weights
     rated_weight_initial_power = 1.0
@@ -118,6 +140,7 @@ class CylinderPhysicsCfg:
     reward_weight_lifetime = 0.45
     reward_weight_uniformity = 0.20
     reward_weight_efficiency = 0.10
+    reward_weight_transient_power = 0.35
     reward_penalty_temp_violation = 2.5e-1
     reward_penalty_mass_loss = 2.0e5
     reward_penalty_feature_violation = 120.0
@@ -154,3 +177,17 @@ class CylinderPhysicsCfg:
     # Export settings
     freecad_cmd = ""
     log_interval = 1
+
+
+def make_training_cfg() -> CylinderPhysicsCfg:
+    cfg = CylinderPhysicsCfg()
+    cfg.grid_mode = "training"
+    return cfg
+
+
+def make_eval_cfg() -> CylinderPhysicsCfg:
+    cfg = CylinderPhysicsCfg()
+    cfg.grid_mode = "evaluation"
+    cfg.num_segments = int(cfg.eval_num_segments)
+    cfg.num_rings = int(cfg.eval_num_rings)
+    return cfg

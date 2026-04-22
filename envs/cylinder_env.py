@@ -5,7 +5,12 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 
-from utils.rated_condition import RatedConditionMetrics, ring_radii_from_points, search_rated_condition
+from utils.rated_condition import (
+    RatedConditionMetrics,
+    ring_radii_from_points,
+    search_rated_condition,
+    simulate_transient_trajectory,
+)
 
 
 class CylinderPhysicsEnv:
@@ -543,6 +548,46 @@ class CylinderPhysicsEnv:
         ring_radius = self._ring_radius_profile(self.points)
         return search_rated_condition(self.cfg, ring_radius, self.initial_volume)
 
+    def _evaluate_transient_window(self, metrics: RatedConditionMetrics, dwell_norm: float) -> Dict[str, float]:
+        dwell_time_s = float(np.clip(dwell_norm, 0.0, 1.0)) * float(self.cfg.lifecycle_reference_s)
+        if dwell_time_s <= 0.0:
+            return {
+                "dwell_time_s": 0.0,
+                "transient_power_w": 0.0,
+                "transient_mean_power_w": 0.0,
+                "transient_peak_temp_k": float(self.cfg.ambient_temp),
+                "transient_mass_loss_kg": 0.0,
+                "transient_power_ratio": 0.0,
+            }
+
+        ring_radius = self._ring_radius_profile(self.points)
+        transient = simulate_transient_trajectory(
+            cfg=self.cfg,
+            ring_radius=ring_radius,
+            voltage_schedule=float(metrics.voltage_v) * float(getattr(self.cfg, "transient_default_voltage_ratio", 1.0)),
+            t_max=dwell_time_s,
+            dt=float(self.cfg.transient_dt_s),
+        )
+        band_power = transient["band_power_w"]
+        temp_hist = transient["temperature_k"]
+        mass_hist = transient["mass_loss_kg"]
+        transient_power_w = float(band_power[-1].item()) if band_power.numel() > 0 else 0.0
+        transient_mean_power_w = float(torch.mean(band_power).item()) if band_power.numel() > 0 else 0.0
+        transient_peak_temp_k = float(torch.max(temp_hist).item())
+        transient_mass_loss_kg = float(mass_hist[-1].item()) if mass_hist.numel() > 0 else 0.0
+        baseline_power = max(
+            float((self.baseline_metrics or metrics).initial_net_band_power_w),
+            1.0e-9,
+        )
+        return {
+            "dwell_time_s": dwell_time_s,
+            "transient_power_w": transient_power_w,
+            "transient_mean_power_w": transient_mean_power_w,
+            "transient_peak_temp_k": transient_peak_temp_k,
+            "transient_mass_loss_kg": transient_mass_loss_kg,
+            "transient_power_ratio": transient_power_w / baseline_power,
+        }
+
     def _score_metrics(self, metrics: RatedConditionMetrics) -> float:
         baseline = self.baseline_metrics or metrics
         initial_ratio = metrics.initial_net_band_power_w / max(baseline.initial_net_band_power_w, 1.0e-9)
@@ -554,6 +599,8 @@ class CylinderPhysicsEnv:
             + self.cfg.reward_weight_lifetime * lifetime_ratio
             + self.cfg.reward_weight_uniformity * metrics.temperature_uniformity
             + self.cfg.reward_weight_efficiency * metrics.band_efficiency
+            - self.cfg.reward_penalty_feasibility * metrics.feasibility_penalty
+            - self.cfg.reward_weight_thermomech * metrics.thermo_mech_penalty
         )
         score -= self.cfg.reward_penalty_mass_loss * max(metrics.mass_loss_rate_kg_s - self.cfg.max_mass_loss_rate, 0.0)
         score -= self.cfg.reward_penalty_temp_violation * max(metrics.max_temperature_k - self.cfg.max_temp, 0.0) ** 2
@@ -641,8 +688,15 @@ class CylinderPhysicsEnv:
         self.bulge_field = torch.clamp(updated_radial_disp, min=0.0)
         self.velocity.zero_()
 
-    def _build_info(self, metrics: RatedConditionMetrics, score: float, reward: float, free_energy: float) -> Dict[str, float]:
-        return {
+    def _build_info(
+        self,
+        metrics: RatedConditionMetrics,
+        score: float,
+        reward: float,
+        free_energy: float,
+        transient_summary: Dict[str, float] | None = None,
+    ) -> Dict[str, float]:
+        info = {
             "score": float(score),
             "reward_delta": float(reward),
             "free_energy": float(free_energy),
@@ -659,6 +713,11 @@ class CylinderPhysicsEnv:
             "circuit_resistance_ohm": float(metrics.resistance_ohm),
             "band_efficiency": float(metrics.band_efficiency),
             "temperature_uniformity": float(metrics.temperature_uniformity),
+            "feasibility_penalty": float(metrics.feasibility_penalty),
+            "thermo_mech_penalty": float(metrics.thermo_mech_penalty),
+            "min_neck_diameter_mm": float(metrics.min_neck_diameter_mm),
+            "max_radius_slope": float(metrics.max_radius_slope),
+            "max_axial_stress_pa": float(metrics.max_axial_stress_pa),
             "lifetime_s": float(metrics.lifetime_s),
             "lifetime_ratio": float(
                 metrics.lifetime_s / max((self.baseline_metrics or metrics).lifetime_s, 1.0e-9)
@@ -671,6 +730,9 @@ class CylinderPhysicsEnv:
             "max_dent_depth": float(torch.abs(self.dent_field).max().item()),
             "step": float(self.current_step),
         }
+        if transient_summary is not None:
+            info.update({k: float(v) for k, v in transient_summary.items()})
+        return info
 
     def step(self, actions):
         self.current_step += 1
@@ -678,11 +740,12 @@ class CylinderPhysicsEnv:
 
         a = torch.as_tensor(actions, dtype=torch.float32, device=self.device).flatten()
         if a.numel() < 3:
-            raise ValueError("actions must contain [index_ratio, indentation, sigma]")
+            raise ValueError("actions must contain [index_ratio, indentation, sigma] or [index_ratio, indentation, sigma, dwell_time]")
 
         idx_ratio = float(torch.clamp(a[0], 0.0, 1.0).item())
         depth = float(torch.clamp(a[1], 0.0, 1.0).item()) * self.cfg.max_depth
         sigma = float(torch.clamp(torch.abs(a[2]), self.cfg.min_sigma, self.cfg.max_sigma).item())
+        dwell_norm = float(torch.clamp(a[3], 0.0, 1.0).item()) if a.numel() >= 4 else 1.0
         target_idx = int(idx_ratio * (self.num_points - 1))
 
         previous_score = float(self.last_score)
@@ -690,8 +753,13 @@ class CylinderPhysicsEnv:
         metrics = self._evaluate_geometry()
         self.current_metrics = metrics
         self._update_pointwise_fields_from_metrics(metrics)
+        transient_summary = self._evaluate_transient_window(metrics, dwell_norm)
         free_energy = self.compute_free_energy(self.points)
-        score = self._score_metrics(metrics) - self.cfg.reward_penalty_free_energy * free_energy
+        score = (
+            self._score_metrics(metrics)
+            + self.cfg.reward_weight_transient_power * float(transient_summary["transient_power_ratio"])
+            - self.cfg.reward_penalty_free_energy * free_energy
+        )
         reward = score - previous_score
         self.last_score = score
         self.best_score = max(self.best_score, score)
@@ -708,5 +776,5 @@ class CylinderPhysicsEnv:
         else:
             done = self.current_step >= self.cfg.max_steps
 
-        info = self._build_info(metrics, score, reward, free_energy)
+        info = self._build_info(metrics, score, reward, free_energy, transient_summary=transient_summary)
         return self._build_observation(), reward, done, info

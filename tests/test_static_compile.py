@@ -11,11 +11,16 @@ class StaticCompileTest(unittest.TestCase):
     def test_sources_compile(self) -> None:
         files = [
             ROOT / "train.py",
+            ROOT / "train_rl.py",
             ROOT / "envs" / "cylinder_env.py",
+            ROOT / "envs" / "cylinder_vec_env.py",
             ROOT / "config" / "cylinder_cfg.py",
             ROOT / "utils" / "exporter.py",
             ROOT / "utils" / "planner.py",
             ROOT / "utils" / "rated_condition.py",
+            ROOT / "utils" / "feasibility.py",
+            ROOT / "utils" / "thermo_mech.py",
+            ROOT / "utils" / "animation.py",
         ]
         for path in files:
             source = path.read_text(encoding="utf-8")

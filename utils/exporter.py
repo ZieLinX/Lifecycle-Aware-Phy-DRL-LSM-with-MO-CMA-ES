@@ -10,6 +10,19 @@ import numpy as np
 import trimesh
 
 
+def points_from_ring_profile(ring_radius: np.ndarray, height: float, num_segments: int) -> np.ndarray:
+    ring_radius = np.asarray(ring_radius, dtype=np.float64).reshape(-1)
+    num_rings = ring_radius.shape[0]
+    z_values = np.linspace(-0.5 * float(height), 0.5 * float(height), num_rings, dtype=np.float64)
+    theta = np.linspace(0.0, 2.0 * np.pi, int(num_segments), endpoint=False, dtype=np.float64)
+    points = []
+    for ridx, z in enumerate(z_values):
+        radius = max(float(ring_radius[ridx]), 1.0e-9)
+        for angle in theta:
+            points.append([radius * np.cos(angle), radius * np.sin(angle), z])
+    return np.asarray(points, dtype=np.float64)
+
+
 def build_cylinder_surface_faces(num_segments: int, num_rings: int) -> np.ndarray:
     """Build triangular side faces for a ring-structured cylinder lattice."""
     faces = []
@@ -202,6 +215,27 @@ def export_env_mesh(env, output_dir: str, output_name: str = "optimized_cylinder
         output_name=output_name,
         export_step=export_step,
         freecad_cmd=getattr(env.cfg, "freecad_cmd", ""),
+    )
+
+
+def export_ring_profile_mesh(
+    ring_radius: np.ndarray,
+    height: float,
+    num_segments: int,
+    output_dir: str,
+    output_name: str = "optimized_cylinder",
+    export_step: bool = True,
+    freecad_cmd: str = "",
+):
+    points = points_from_ring_profile(ring_radius=ring_radius, height=height, num_segments=num_segments)
+    return export_mesh_files(
+        points=points,
+        num_segments=num_segments,
+        num_rings=int(np.asarray(ring_radius).reshape(-1).shape[0]),
+        output_dir=output_dir,
+        output_name=output_name,
+        export_step=export_step,
+        freecad_cmd=freecad_cmd,
     )
 
 

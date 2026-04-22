@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from config.cylinder_cfg import CylinderPhysicsCfg
+from config.cylinder_cfg import CylinderPhysicsCfg, make_eval_cfg
 from envs.cylinder_env import CylinderPhysicsEnv
 from utils.rated_condition import search_rated_condition
 
@@ -42,6 +42,18 @@ class PhysicsRegressionTest(unittest.TestCase):
         self.assertTrue(math.isfinite(metrics.max_temperature_k))
         self.assertGreater(metrics.thermal_iterations, 0)
         self.assertTrue(metrics.thermal_residual_k >= 0.0)
+
+    def test_external_series_resistance_is_zero_by_default(self) -> None:
+        cfg = CylinderPhysicsCfg()
+        self.assertEqual(cfg.external_series_resistance, 0.0)
+
+    def test_fine_grid_resolution_meets_spec(self) -> None:
+        cfg = make_eval_cfg()
+        dx = min(
+            2.0 * math.pi * cfg.radius / cfg.num_segments,
+            cfg.height / max(cfg.num_rings - 1, 1),
+        )
+        self.assertLessEqual(dx, 1.01e-4)
 
 
 if __name__ == "__main__":
