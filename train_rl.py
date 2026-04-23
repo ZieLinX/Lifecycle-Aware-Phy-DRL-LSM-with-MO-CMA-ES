@@ -19,12 +19,17 @@ from rl_games.torch_runner import Runner
 
 from config.cylinder_cfg import make_eval_cfg, make_training_cfg
 from envs.cylinder_vec_env import CylinderVecEnv
-from utils.animation import export_topology_evolution_animation
+from utils.animation import build_realtime_animation, export_topology_evolution_animation, save_realtime_frame
 from utils.exporter import export_ring_profile_mesh
 
 
 class MCGARlGamesVecEnv(IVecEnv):
     def __init__(self, config_name, num_actors, **kwargs):
+        # Consume fields meant for this wrapper before forwarding to env creator.
+        self._realtime_dir: str | None = kwargs.pop("realtime_dir", None)
+        self._realtime_interval: int = int(kwargs.pop("realtime_interval", 4))
+        self._global_step = 0
+        # Pass remaining kwargs (e.g. cfg) through to the underlying env creator.
         creator = env_configurations.configurations[config_name]["env_creator"]
         self.env = creator(num_envs=num_actors, **kwargs)
         self.action_space = self.env.single_action_space
@@ -36,6 +41,29 @@ class MCGARlGamesVecEnv(IVecEnv):
         if np.any(dones):
             obs = self.env.reset_done(dones)
         info["time_outs"] = truncated
+        self._global_step += 1
+        if self._realtime_dir is not None and self._global_step % self._realtime_interval == 0:
+            try:
+                ring_r = self.env.ring_radius[0].detach().cpu().numpy()
+                m = self.env.current_metrics
+                metrics_snap = {
+                    "rated_voltage_v": float(m["voltage_v"][0].item()),
+                    "initial_net_band_power_w": float(m["initial_net_band_power_w"][0].item()),
+                    "lifetime_ratio": float(
+                        m["lifetime_s"][0].item()
+                        / max(float(self.env.baseline_metrics["lifetime_s"][0].item()), 1.0e-9)
+                    ),
+                    "feasible": bool(m["feasible"][0].item()),
+                }
+                save_realtime_frame(
+                    ring_r,
+                    self.env.cfg.height,
+                    metrics_snap,
+                    self._realtime_dir,
+                    self._global_step,
+                )
+            except Exception:
+                pass
         return obs, reward, dones, info
 
     def reset(self):
@@ -62,7 +90,7 @@ class MCGARlGamesVecEnv(IVecEnv):
 
 def _register_rl_games_env():
     if "MCGA" not in vecenv.vecenv_config:
-        vecenv.register("MCGA", lambda config_name, num_actors, **kwargs: MCGARlGamesVecEnv(config_name, num_actors, **kwargs))
+        vecenv.register("MCGA", lambda config_name, num_actors, **kw: MCGARlGamesVecEnv(config_name, num_actors, **kw))
     if "mcga_cylinder" not in env_configurations.configurations:
         env_configurations.register(
             "mcga_cylinder",
@@ -83,7 +111,10 @@ def _load_config(config_path: Path, args) -> dict:
     params = config["params"]
     train_cfg = params["config"]
     train_cfg["features"]["observer"] = DefaultAlgoObserver()
+    realtime_dir = str(Path(args.train_dir) / args.experiment_name / "realtime") if int(args.realtime_interval) > 0 else None
     train_cfg["env_config"]["cfg"] = cfg
+    train_cfg["env_config"]["realtime_dir"] = realtime_dir
+    train_cfg["env_config"]["realtime_interval"] = int(args.realtime_interval)
     train_cfg["device"] = "cuda:0"
     train_cfg["name"] = args.experiment_name
     train_cfg["train_dir"] = args.train_dir
@@ -277,6 +308,7 @@ def main():
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--eval-steps", type=int, default=40)
     parser.add_argument("--final-eval-dir", type=str, default="outputs/final_eval")
+    parser.add_argument("--realtime-interval", type=int, default=4, help="Save realtime shape snapshot every N RL steps (0 = disabled)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
@@ -291,6 +323,16 @@ def main():
     runner.reset()
     runner.run({"train": True, "play": False, "checkpoint": "", "sigma": None})
     checkpoint_path = _latest_checkpoint(Path(args.train_dir), args.experiment_name)
+
+    # Build realtime animation from shape snapshots captured during training.
+    if int(args.realtime_interval) > 0:
+        realtime_dir = str(Path(args.train_dir) / args.experiment_name / "realtime")
+        realtime_anim = build_realtime_animation(realtime_dir, output_name="training_evolution", fps=6)
+        if realtime_anim["gif"]:
+            print(f"[rl] realtime animation: {realtime_anim['gif']}", flush=True)
+        if realtime_anim["mp4"]:
+            print(f"[rl] realtime mp4: {realtime_anim['mp4']}", flush=True)
+
     _run_final_evaluation(config, checkpoint_path, args)
 
 

@@ -5,6 +5,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 
+from utils.feasibility import project_connected_profile
 from utils.rated_condition import (
     RatedConditionMetrics,
     ring_radii_from_points,
@@ -683,6 +684,24 @@ class CylinderPhysicsEnv:
         self.points[:, :2] = radial_dir * new_radius.unsqueeze(1)
         self._enforce_volume_conservation(movable_mask)
         self._apply_electrode_constraints()
+        # Project ring-level radii onto connected profile to prevent floating geometry.
+        max_step = float(getattr(self.cfg, "feasibility_area_ratio_max", 5.0)) ** 0.5
+        ring_r = self._ring_radius_profile(self.points)
+        projected_r = project_connected_profile(
+            ring_r,
+            min_radius=float(self.cfg.min_radius),
+            max_step_ratio=max_step,
+            fix_endpoints=bool(getattr(self.cfg, "keep_electrode_rings_fixed", True)),
+        )
+        # Propagate projected radii back to point positions.
+        for r_idx in range(self.cfg.num_rings):
+            mask = self.ring_index == r_idx
+            if not torch.any(mask):
+                continue
+            old_r = torch.norm(self.points[mask, :2], dim=1).clamp_min(1.0e-9)
+            target_r = float(projected_r[r_idx].item())
+            scale = target_r / old_r
+            self.points[mask, :2] = self.points[mask, :2] * scale.unsqueeze(1)
         updated_radial_disp = torch.norm(self.points[:, :2], dim=1) - self.cfg.radius
         self.dent_field = torch.clamp(updated_radial_disp, max=0.0)
         self.bulge_field = torch.clamp(updated_radial_disp, min=0.0)

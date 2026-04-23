@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from gymnasium.spaces import Box
 
+from utils.feasibility import project_connected_profile_batch
 from utils.rated_condition import search_rated_condition_batch, simulate_transient_trajectory
 
 
@@ -127,8 +128,18 @@ class CylinderVecEnv:
             self.ring_radius + scale * projected,
             min=float(self.cfg.min_radius),
         )
+        # Electrode rings are fixed at nominal radius.
         self.ring_radius[:, 0] = float(self.cfg.radius)
         self.ring_radius[:, -1] = float(self.cfg.radius)
+        # Enforce geometric connectivity: project onto slope-limited connected profile
+        # so that no adjacent cross-section ratio can create a physically floating island.
+        max_step = float(getattr(self.cfg, "feasibility_area_ratio_max", 5.0)) ** 0.5
+        self.ring_radius = project_connected_profile_batch(
+            self.ring_radius,
+            min_radius=float(self.cfg.min_radius),
+            max_step_ratio=max_step,
+            fix_endpoints=bool(getattr(self.cfg, "keep_electrode_rings_fixed", True)),
+        )
         return dwell
 
     def _transient_summary(self, metrics: Dict[str, torch.Tensor], dwell: torch.Tensor) -> Dict[str, torch.Tensor]:
