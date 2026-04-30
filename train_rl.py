@@ -9,7 +9,7 @@ import os
 from copy import deepcopy
 from pathlib import Path
 
-os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+os.environ.setdefault("TORCH_COMPILE_DISABLE", "0")
 
 import numpy as np
 import torch
@@ -173,6 +173,8 @@ def _load_config(config_path: Path, args) -> dict:
     params = config["params"]
     train_cfg = params["config"]
     train_cfg["features"]["observer"] = ProgressAlgoObserver(total_epochs=args.max_epochs)
+    if bool(getattr(args, "torch_compile", False)):
+        train_cfg["torch_compile"] = True
     realtime_dir = str(Path(args.train_dir) / args.experiment_name / "realtime") if int(args.realtime_interval) > 0 else None
     train_cfg["env_config"]["cfg"] = cfg
     train_cfg["env_config"]["realtime_dir"] = realtime_dir
@@ -398,6 +400,7 @@ def main():
     parser.add_argument("--final-eval-dir", type=str, default="outputs/final_eval")
     parser.add_argument("--realtime-interval", type=int, default=4, help="Save realtime shape snapshot every N RL steps (0 = disabled)")
     parser.add_argument("--console-interval", type=int, default=20, help="Print live metrics every N RL steps (0 = disabled)")
+    parser.add_argument("--torch-compile", action="store_true", help="Enable torch.compile in rl_games (may improve throughput).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
