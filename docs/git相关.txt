@@ -1,0 +1,24 @@
+# git提交代码
+## clone
+XiZie@Proving MINGW64 /d/TEMP/codec
+$ git clone https://chenxil.top/Machine_without_learning/make_cylinder_great_again.git
+## 查看分支
+XiZie@Proving MINGW64 /d/TEMP/codec/make_cylinder_great_again (master)
+$ git branch
+* master
+## 新建分支
+XiZie@Proving MINGW64 /d/TEMP/codec/make_cylinder_great_again (master)
+$ git checkout -b xzh
+Switched to a new branch 'xzh'
+## 改完代码后上传
+XiZie@Proving MINGW64 /d/TEMP/codec/make_cylinder_great_again (xzh)
+$git add .
+
+XiZie@Proving MINGW64 /d/TEMP/codec/make_cylinder_great_again (xzh)
+$ git status
+## 添加注释
+XiZie@Proving MINGW64 /d/TEMP/codec/make_cylinder_great_again (xzh)
+$ git commit -m "这是一版性能很差，效果不明的半成品代码"
+## push上去
+XiZie@Proving MINGW64 /d/TEMP/codec/make_cylinder_great_again (xzh)
+$ git push origin xzh
