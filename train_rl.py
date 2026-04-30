@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+print("[rl] booting train_rl.py", flush=True)
+
 import argparse
 import csv
 import json
