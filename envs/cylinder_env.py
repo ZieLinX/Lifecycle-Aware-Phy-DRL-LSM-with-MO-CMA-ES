@@ -11,6 +11,7 @@ from utils.rated_condition import (
     ring_radii_from_points,
     search_rated_condition,
     simulate_transient_trajectory,
+    summarize_transient_selection,
 )
 
 
@@ -550,44 +551,27 @@ class CylinderPhysicsEnv:
         return search_rated_condition(self.cfg, ring_radius, self.initial_volume)
 
     def _evaluate_transient_window(self, metrics: RatedConditionMetrics, dwell_norm: float) -> Dict[str, float]:
-        dwell_time_s = float(np.clip(dwell_norm, 0.0, 1.0)) * float(self.cfg.lifecycle_reference_s)
-        if dwell_time_s <= 0.0:
-            return {
-                "dwell_time_s": 0.0,
-                "transient_power_w": 0.0,
-                "transient_mean_power_w": 0.0,
-                "transient_peak_temp_k": float(self.cfg.ambient_temp),
-                "transient_mass_loss_kg": 0.0,
-                "transient_power_ratio": 0.0,
-            }
-
+        horizon_s = float(getattr(self.cfg, "transient_max_time_s", self.cfg.lifecycle_reference_s))
+        policy_dwell_time_s = float(np.clip(dwell_norm, 0.0, 1.0)) * horizon_s
         ring_radius = self._ring_radius_profile(self.points)
         transient = simulate_transient_trajectory(
             cfg=self.cfg,
             ring_radius=ring_radius,
             voltage_schedule=float(metrics.voltage_v) * float(getattr(self.cfg, "transient_default_voltage_ratio", 1.0)),
-            t_max=dwell_time_s,
+            t_max=horizon_s,
             dt=float(self.cfg.transient_dt_s),
         )
-        band_power = transient["band_power_w"]
-        temp_hist = transient["temperature_k"]
-        mass_hist = transient["mass_loss_kg"]
-        transient_power_w = float(band_power[-1].item()) if band_power.numel() > 0 else 0.0
-        transient_mean_power_w = float(torch.mean(band_power).item()) if band_power.numel() > 0 else 0.0
-        transient_peak_temp_k = float(torch.max(temp_hist).item())
-        transient_mass_loss_kg = float(mass_hist[-1].item()) if mass_hist.numel() > 0 else 0.0
         baseline_power = max(
             float((self.baseline_metrics or metrics).initial_net_band_power_w),
             1.0e-9,
         )
-        return {
-            "dwell_time_s": dwell_time_s,
-            "transient_power_w": transient_power_w,
-            "transient_mean_power_w": transient_mean_power_w,
-            "transient_peak_temp_k": transient_peak_temp_k,
-            "transient_mass_loss_kg": transient_mass_loss_kg,
-            "transient_power_ratio": transient_power_w / baseline_power,
-        }
+        summary = summarize_transient_selection(
+            self.cfg,
+            transient,
+            baseline_power_w=baseline_power,
+            dwell_time_s=policy_dwell_time_s,
+        )
+        return {key: float(value.item()) if isinstance(value, torch.Tensor) else float(value) for key, value in summary.items()}
 
     def _score_metrics(self, metrics: RatedConditionMetrics) -> float:
         baseline = self.baseline_metrics or metrics

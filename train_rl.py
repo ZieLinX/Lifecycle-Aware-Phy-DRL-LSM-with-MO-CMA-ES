@@ -124,11 +124,18 @@ def _load_config(config_path: Path, args) -> dict:
         train_cfg["max_epochs"] = int(args.max_epochs)
     if args.smoke:
         train_cfg["num_actors"] = 2
-        train_cfg["max_epochs"] = 2
-        train_cfg["horizon_length"] = 8
-        train_cfg["minibatch_size"] = 16
-        cfg.max_steps = min(cfg.max_steps, 4)
+        train_cfg["max_epochs"] = 1
+        train_cfg["horizon_length"] = 4
+        train_cfg["minibatch_size"] = 8
+        cfg.max_steps = min(cfg.max_steps, 2)
         cfg.num_rings = 24
+        cfg.num_segments = 32
+        cfg.voltage_grid_points = 3
+        cfg.voltage_refine_levels = 0
+        cfg.voltage_refine_points = 3
+        cfg.thermal_max_iters = 32
+        cfg.transient_max_time_s = 2.0
+        cfg.transient_dt_s = 1.0
     batch_size = int(train_cfg["num_actors"]) * int(train_cfg["horizon_length"])
     train_cfg["minibatch_size"] = min(int(train_cfg.get("minibatch_size", batch_size)), batch_size)
     params["seed"] = int(args.seed)
@@ -218,6 +225,16 @@ def _run_final_evaluation(base_config: dict, checkpoint_path: Path, args):
     eval_cfg = make_eval_cfg()
     eval_cfg.device = "cuda:0"
     eval_cfg.max_steps = int(args.eval_steps)
+    if args.smoke:
+        eval_cfg.num_segments = 48
+        eval_cfg.num_rings = 48
+        eval_cfg.max_steps = min(int(args.eval_steps), 2)
+        eval_cfg.voltage_grid_points = 3
+        eval_cfg.voltage_refine_levels = 0
+        eval_cfg.voltage_refine_points = 3
+        eval_cfg.thermal_max_iters = 32
+        eval_cfg.transient_max_time_s = 2.0
+        eval_cfg.transient_dt_s = 1.0
     eval_env = CylinderVecEnv(eval_cfg, num_envs=1)
     obs, _ = eval_env.reset()
     ring_history = [eval_env.ring_radius[0].detach().cpu().numpy().copy()]
@@ -236,7 +253,11 @@ def _run_final_evaluation(base_config: dict, checkpoint_path: Path, args):
                 "reward": float(reward[0]),
                 "score": float(info["score"][0]),
                 "dwell_time_s": float(info["dwell_time_s"][0]),
+                "optimal_transient_time_s": float(info["optimal_transient_time_s"][0]),
+                "policy_dwell_time_s": float(info["policy_dwell_time_s"][0]),
                 "transient_power_w": float(info["transient_power_w"][0]),
+                "transient_mean_power_w": float(info["transient_mean_power_w"][0]),
+                "transient_objective": float(info["transient_objective"][0]),
                 "feasible": bool(eval_env.current_metrics["feasible"][0].item()),
             }
         )
@@ -287,6 +308,10 @@ def _run_final_evaluation(base_config: dict, checkpoint_path: Path, args):
         "lifetime_ratio": float(final["lifetime_s"] / max(float(baseline["lifetime_s"]), 1.0e-9)),
         "feature_change_ratio": float(final["feature_change_ratio"]),
         "volume_change_ratio": float(final["volume_change_ratio"]),
+        "final_optimal_transient_time_s": float(final.get("optimal_transient_time_s", 0.0)),
+        "final_transient_power_w": float(final.get("transient_power_w", 0.0)),
+        "final_transient_mean_power_w": float(final.get("transient_mean_power_w", 0.0)),
+        "final_transient_objective": float(final.get("transient_objective", 0.0)),
         "feasible": bool(final["feasible"]),
         "gif": animation_info["gif"],
         "mp4": animation_info["mp4"],

@@ -24,6 +24,8 @@ class VecEnvTest(unittest.TestCase):
         self.assertEqual(terminated.shape, (4,))
         self.assertEqual(truncated.shape, (4,))
         self.assertIn("score", info)
+        self.assertIn("optimal_transient_time_s", info)
+        self.assertIn("policy_dwell_time_s", info)
 
 
 if __name__ == "__main__":

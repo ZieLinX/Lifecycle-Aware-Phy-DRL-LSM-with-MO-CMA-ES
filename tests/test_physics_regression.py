@@ -42,6 +42,7 @@ class PhysicsRegressionTest(unittest.TestCase):
         self.assertTrue(math.isfinite(metrics.max_temperature_k))
         self.assertGreater(metrics.thermal_iterations, 0)
         self.assertTrue(metrics.thermal_residual_k >= 0.0)
+        self.assertTrue(metrics.feasible)
 
     def test_external_series_resistance_is_zero_by_default(self) -> None:
         cfg = CylinderPhysicsCfg()

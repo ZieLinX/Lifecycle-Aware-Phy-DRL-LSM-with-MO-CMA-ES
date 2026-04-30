@@ -9,7 +9,7 @@ import torch
 from gymnasium.spaces import Box
 
 from utils.feasibility import project_connected_profile_batch
-from utils.rated_condition import search_rated_condition_batch, simulate_transient_trajectory
+from utils.rated_condition import search_rated_condition_batch, simulate_transient_trajectory, summarize_transient_selection
 
 
 class CylinderVecEnv:
@@ -143,30 +143,22 @@ class CylinderVecEnv:
         return dwell
 
     def _transient_summary(self, metrics: Dict[str, torch.Tensor], dwell: torch.Tensor) -> Dict[str, torch.Tensor]:
-        dwell_time_s = dwell * float(self.cfg.lifecycle_reference_s)
+        horizon_s = float(getattr(self.cfg, "transient_max_time_s", self.cfg.lifecycle_reference_s))
+        policy_dwell_time_s = dwell * horizon_s
         transient = simulate_transient_trajectory(
             cfg=self.cfg,
             ring_radius=self.ring_radius,
             voltage_schedule=metrics["voltage_v"] * float(getattr(self.cfg, "transient_default_voltage_ratio", 1.0)),
-            t_max=float(torch.max(dwell_time_s).item()) if self.num_envs > 0 else float(self.cfg.transient_dt_s),
+            t_max=horizon_s,
             dt=float(self.cfg.transient_dt_s),
         )
-        band_power = transient["band_power_w"]
-        temp_hist = transient["temperature_k"]
-        mass_hist = transient["mass_loss_kg"]
-        step_index = torch.clamp((dwell_time_s / max(float(self.cfg.transient_dt_s), 1.0e-6)).long(), min=0, max=max(band_power.shape[1] - 1, 0))
-        batch_index = torch.arange(self.num_envs, device=self.device)
-        transient_power = band_power[batch_index, step_index] if band_power.shape[1] > 0 else torch.zeros(self.num_envs, device=self.device)
-        transient_peak_temp = torch.amax(temp_hist, dim=(1, 2))
-        transient_mass = mass_hist[batch_index, torch.clamp(step_index + 1, max=mass_hist.shape[1] - 1)]
         baseline_power = torch.clamp(self.baseline_metrics["initial_net_band_power_w"], min=1.0e-9)
-        return {
-            "dwell_time_s": dwell_time_s,
-            "transient_power_w": transient_power,
-            "transient_peak_temp_k": transient_peak_temp,
-            "transient_mass_loss_kg": transient_mass,
-            "transient_power_ratio": transient_power / baseline_power,
-        }
+        return summarize_transient_selection(
+            self.cfg,
+            transient,
+            baseline_power_w=baseline_power,
+            dwell_time_s=policy_dwell_time_s,
+        )
 
     def _score(self, metrics: Dict[str, torch.Tensor], transient: Dict[str, torch.Tensor]) -> torch.Tensor:
         baseline = self.baseline_metrics
@@ -281,6 +273,10 @@ class CylinderVecEnv:
             "rated_voltage_v": self.current_metrics["voltage_v"].detach().cpu().numpy(),
             "transient_power_w": transient["transient_power_w"].detach().cpu().numpy(),
             "dwell_time_s": transient["dwell_time_s"].detach().cpu().numpy(),
+            "optimal_transient_time_s": transient["optimal_transient_time_s"].detach().cpu().numpy(),
+            "policy_dwell_time_s": transient["policy_dwell_time_s"].detach().cpu().numpy(),
+            "transient_mean_power_w": transient["transient_mean_power_w"].detach().cpu().numpy(),
+            "transient_objective": transient["transient_objective"].detach().cpu().numpy(),
             "feasibility_penalty": self.current_metrics["feasibility_penalty"].detach().cpu().numpy(),
             "thermo_mech_penalty": self.current_metrics["thermo_mech_penalty"].detach().cpu().numpy(),
         }

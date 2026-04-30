@@ -40,14 +40,18 @@ class CylinderPhysicsCfg:
     rho_elec_temp_coeff = 3.5e-3
 
     # Voltage is an upper bound for rated-condition search, not a fixed always-on load.
-    min_voltage = 5.0
+    min_voltage = 0.01
     max_voltage = 100.0
+    voltage_grid_spacing = "log"
     voltage_grid_points = 11
     voltage_refine_levels = 2
     voltage_refine_points = 7
+    voltage_refine_spacing = "log"
     voltage_focus_ratio = 0.18
     min_resistance = 1e-6
-    max_current = 5.0e3
+    # Numerical guard only. The task defines a voltage-source upper bound, not
+    # a current-source operating mode.
+    max_current = 1.0e9
     # Q23: the rated voltage is applied across tungsten only.
     external_series_resistance = 0.0
 
@@ -73,6 +77,7 @@ class CylinderPhysicsCfg:
     thermal_pseudo_dt = 0.02
     thermal_max_iters = 160
     thermal_tol_k = 0.05
+    thermal_max_delta_k = 35.0
     in_band_upper_um = 3.0
     band_fraction_min_temp = 300.0
     band_fraction_max_temp = 4200.0
@@ -85,6 +90,15 @@ class CylinderPhysicsCfg:
     transient_dt_s = 0.5
     transient_max_time_s = 120.0
     transient_default_voltage_ratio = 1.0
+    transient_max_delta_k = 80.0
+    # Time is not assumed to be optimal at the end of the transient window.
+    # "search" evaluates the whole warm-up window and reports/rewards the best
+    # admissible sampling time; "action" keeps legacy policy-selected dwell use.
+    transient_time_selection = "search"
+    transient_min_time_s = 0.0
+    transient_weight_mean_power = 0.20
+    transient_penalty_mass_loss = 0.05
+    transient_penalty_temp_violation = 2.5e-1
 
     # Mechanics / shape control
     mass_lumped = 0.02
