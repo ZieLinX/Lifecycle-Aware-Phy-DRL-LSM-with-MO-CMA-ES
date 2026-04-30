@@ -74,6 +74,7 @@ class MCGARlGamesVecEnv(IVecEnv):
         # Consume fields meant for this wrapper before forwarding to env creator.
         self._realtime_dir: str | None = kwargs.pop("realtime_dir", None)
         self._realtime_interval: int = int(kwargs.pop("realtime_interval", 4))
+        self._console_interval: int = int(kwargs.pop("console_interval", 0))
         self._global_step = 0
         # Pass remaining kwargs (e.g. cfg) through to the underlying env creator.
         creator = env_configurations.configurations[config_name]["env_creator"]
@@ -88,6 +89,21 @@ class MCGARlGamesVecEnv(IVecEnv):
             obs = self.env.reset_done(dones)
         info["time_outs"] = truncated
         self._global_step += 1
+        if self._console_interval > 0 and self._global_step % self._console_interval == 0:
+            try:
+                m = self.env.current_metrics
+                base = self.env.baseline_metrics
+                life_ratio = float(m["lifetime_s"][0].item()) / max(float(base["lifetime_s"][0].item()), 1.0e-9)
+                print(
+                    f"[rl] step={self._global_step} "
+                    f"V*={float(m['voltage_v'][0].item()):.3g} "
+                    f"P0-3={float(m['initial_net_band_power_w'][0].item()):.3g}W "
+                    f"life={life_ratio:.3f} "
+                    f"feasible={bool(m['feasible'][0].item())}",
+                    flush=True,
+                )
+            except Exception:
+                pass
         if self._realtime_dir is not None and self._global_step % self._realtime_interval == 0:
             try:
                 ring_r = self.env.ring_radius[0].detach().cpu().numpy()
@@ -161,6 +177,7 @@ def _load_config(config_path: Path, args) -> dict:
     train_cfg["env_config"]["cfg"] = cfg
     train_cfg["env_config"]["realtime_dir"] = realtime_dir
     train_cfg["env_config"]["realtime_interval"] = int(args.realtime_interval)
+    train_cfg["env_config"]["console_interval"] = int(getattr(args, "console_interval", 0))
     train_cfg["device"] = "cuda:0"
     train_cfg["name"] = args.experiment_name
     train_cfg["train_dir"] = args.train_dir
@@ -380,6 +397,7 @@ def main():
     parser.add_argument("--eval-steps", type=int, default=40)
     parser.add_argument("--final-eval-dir", type=str, default="outputs/final_eval")
     parser.add_argument("--realtime-interval", type=int, default=4, help="Save realtime shape snapshot every N RL steps (0 = disabled)")
+    parser.add_argument("--console-interval", type=int, default=20, help="Print live metrics every N RL steps (0 = disabled)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
