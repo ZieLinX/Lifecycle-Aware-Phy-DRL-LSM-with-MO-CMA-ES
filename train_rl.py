@@ -168,6 +168,13 @@ def _load_config(config_path: Path, args) -> dict:
         config = yaml.safe_load(f)
     cfg = make_training_cfg()
     cfg.device = "cuda:0"
+    if getattr(args, "fast_physics", False):
+        cfg.enable_feasibility = False
+        cfg.enable_thermomech = False
+        cfg.voltage_grid_points = min(int(cfg.voltage_grid_points), 7)
+        cfg.voltage_refine_levels = min(int(cfg.voltage_refine_levels), 1)
+        cfg.voltage_refine_points = min(int(cfg.voltage_refine_points), 5)
+        cfg.thermal_max_iters = min(int(cfg.thermal_max_iters), 96)
     if args.max_steps is not None:
         cfg.max_steps = int(args.max_steps)
     params = config["params"]
@@ -398,6 +405,7 @@ def main():
     parser.add_argument("--final-eval-dir", type=str, default="outputs/final_eval")
     parser.add_argument("--realtime-interval", type=int, default=4, help="Save realtime shape snapshot every N RL steps (0 = disabled)")
     parser.add_argument("--console-interval", type=int, default=20, help="Print live metrics every N RL steps (0 = disabled)")
+    parser.add_argument("--fast-physics", action="store_true", help="Disable CPU-heavy feasibility/thermo-mech reports for faster training.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()

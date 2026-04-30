@@ -131,6 +131,9 @@ class CylinderPhysicsCfg:
     feasibility_area_ratio_min = 0.20
     feasibility_area_ratio_max = 5.0
     feasibility_max_slope = 0.35
+    # Training speed knobs: feasibility/thermo-mech reports are Python-heavy.
+    # Keep them on for evaluation, but allow disabling for throughput-focused runs.
+    enable_feasibility = True
     reward_penalty_feasibility = 10.0
     rated_penalty_feasibility = 25.0
     enable_thermomech = True
