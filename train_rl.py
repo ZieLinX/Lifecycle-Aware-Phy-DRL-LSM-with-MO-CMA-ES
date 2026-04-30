@@ -23,6 +23,50 @@ from utils.animation import build_realtime_animation, export_topology_evolution_
 from utils.exporter import export_ring_profile_mesh
 
 
+class ProgressAlgoObserver(DefaultAlgoObserver):
+    def __init__(self, total_epochs: int | None = None):
+        super().__init__()
+        self._total_epochs = int(total_epochs) if total_epochs is not None else None
+        self._pbar = None
+        self._last_epoch = -1
+
+    def after_init(self, algo):
+        super().after_init(algo)
+        total = self._total_epochs
+        if total is None:
+            total = int(getattr(algo, "max_epochs", 0)) or None
+        try:
+            from tqdm import tqdm  # type: ignore
+
+            self._pbar = tqdm(total=total, desc="[rl] training", unit="epoch", dynamic_ncols=True)
+        except Exception:
+            self._pbar = None
+
+    def after_print_stats(self, frame, epoch_num, total_time):
+        super().after_print_stats(frame, epoch_num, total_time)
+        mean_scores = None
+        try:
+            if getattr(self, "game_scores", None) is not None and self.game_scores.current_size > 0:
+                mean_scores = float(self.game_scores.get_mean())
+        except Exception:
+            mean_scores = None
+
+        if self._pbar is not None:
+            inc = int(epoch_num) - int(self._last_epoch)
+            if inc > 0:
+                self._pbar.update(inc)
+                self._last_epoch = int(epoch_num)
+            postfix = {"frame": int(frame), "time_s": f"{float(total_time):.0f}"}
+            if mean_scores is not None:
+                postfix["score_mean"] = f"{mean_scores:.3f}"
+            self._pbar.set_postfix(postfix)
+        else:
+            msg = f"[rl] epoch={int(epoch_num)} frame={int(frame)} time_s={float(total_time):.1f}"
+            if mean_scores is not None:
+                msg += f" score_mean={mean_scores:.3f}"
+            print(msg, flush=True)
+
+
 class MCGARlGamesVecEnv(IVecEnv):
     def __init__(self, config_name, num_actors, **kwargs):
         # Consume fields meant for this wrapper before forwarding to env creator.
@@ -110,7 +154,7 @@ def _load_config(config_path: Path, args) -> dict:
         cfg.max_steps = int(args.max_steps)
     params = config["params"]
     train_cfg = params["config"]
-    train_cfg["features"]["observer"] = DefaultAlgoObserver()
+    train_cfg["features"]["observer"] = ProgressAlgoObserver(total_epochs=args.max_epochs)
     realtime_dir = str(Path(args.train_dir) / args.experiment_name / "realtime") if int(args.realtime_interval) > 0 else None
     train_cfg["env_config"]["cfg"] = cfg
     train_cfg["env_config"]["realtime_dir"] = realtime_dir
