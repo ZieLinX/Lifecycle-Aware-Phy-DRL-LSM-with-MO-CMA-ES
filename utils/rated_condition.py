@@ -7,8 +7,8 @@ from typing import Dict
 
 import numpy as np
 import torch
-from utils.feasibility import evaluate_feasibility
-from utils.thermo_mech import evaluate_thermo_mech
+from utils.feasibility import evaluate_feasibility, evaluate_feasibility_batch
+from utils.thermo_mech import evaluate_thermo_mech, evaluate_thermo_mech_batch
 
 
 @dataclass(frozen=True)
@@ -144,14 +144,6 @@ def _feature_change_ratio(cfg, ring_radius: torch.Tensor) -> float:
         eq_d = 2.0 * ring_radius
         return float(torch.max(torch.abs(eq_d - ref_d) / ref_d).item())
     return float(torch.max(torch.abs(ring_radius - cfg.radius) / max(cfg.radius, 1.0e-12)).item())
-
-
-def _feature_change_ratio_batch(cfg, ring_radius_batch: torch.Tensor) -> torch.Tensor:
-    if getattr(cfg, "feature_scale_mode", "equivalent_diameter") == "equivalent_diameter":
-        ref_d = max(float(getattr(cfg, "feature_reference_diameter_m", 2.0 * cfg.radius)), 1.0e-12)
-        eq_d = 2.0 * ring_radius_batch
-        return torch.amax(torch.abs(eq_d - ref_d) / ref_d, dim=1)
-    return torch.amax(torch.abs(ring_radius_batch - float(cfg.radius)) / max(float(cfg.radius), 1.0e-12), dim=1)
 
 
 def _apply_thermal_boundary_mode(cfg, temperature: torch.Tensor) -> torch.Tensor:
@@ -779,29 +771,16 @@ def _evaluate_voltage_batch(
     surface = 2.0 * math.pi * clamped_radius * axial_weight
     volume = torch.sum(area * axial_weight, dim=1)
     volume_change_ratio = torch.abs(volume - initial_volume_batch) / torch.clamp(initial_volume_batch, min=1.0e-12)
-    feature_change_ratio = _feature_change_ratio_batch(cfg, ring_radius_batch)
+    feature_change_ratio = torch.as_tensor(
+        [_feature_change_ratio(cfg, ring_radius_batch[idx]) for idx in range(batch_size)],
+        dtype=torch.float32,
+        device=device,
+    )
     roughness = torch.std(ring_radius_batch, dim=1) / torch.clamp(torch.mean(ring_radius_batch, dim=1), min=1.0e-12)
-    if bool(getattr(cfg, "enable_feasibility", True)):
-        feasibility_reports = [evaluate_feasibility(cfg, ring_radius_batch[idx]) for idx in range(batch_size)]
-        feasibility_penalty = torch.as_tensor(
-            [report.soft_penalty for report in feasibility_reports],
-            dtype=torch.float32,
-            device=device,
-        )
-        min_neck_diameter_mm = torch.as_tensor(
-            [report.min_diameter_m * 1.0e3 for report in feasibility_reports],
-            dtype=torch.float32,
-            device=device,
-        )
-        max_radius_slope = torch.as_tensor(
-            [report.max_slope for report in feasibility_reports],
-            dtype=torch.float32,
-            device=device,
-        )
-    else:
-        feasibility_penalty = torch.zeros((batch_size,), dtype=torch.float32, device=device)
-        min_neck_diameter_mm = 2.0 * torch.amin(ring_radius_batch, dim=1) * 1.0e3
-        max_radius_slope = torch.zeros((batch_size,), dtype=torch.float32, device=device)
+    feasibility = evaluate_feasibility_batch(cfg, ring_radius_batch)
+    feasibility_penalty = feasibility["soft_penalty"].to(dtype=torch.float32)
+    min_neck_diameter_mm = (feasibility["min_diameter_m"] * 1.0e3).to(dtype=torch.float32)
+    max_radius_slope = feasibility["max_slope"].to(dtype=torch.float32)
 
     if num_rings > 1:
         grad = torch.gradient(ring_radius_batch, spacing=dz, dim=1)[0] / max(cfg.radius, 1.0e-12)
@@ -911,21 +890,9 @@ def _evaluate_voltage_batch(
     lifecycle_factor = torch.clamp(lifetime_s / (lifetime_s + float(cfg.lifecycle_reference_s)), min=0.0, max=1.0)
     smoothness_factor = torch.clamp(1.0 - 0.20 * roughness - 0.30 * feature_change_ratio, min=0.35, max=1.0)
     average_band_power = net_band_power * lifecycle_factor * smoothness_factor
-    if bool(getattr(cfg, "enable_thermomech", True)):
-        thermo_reports = [evaluate_thermo_mech(cfg, temperature[idx]) for idx in range(batch_size)]
-        thermo_mech_penalty = torch.as_tensor(
-            [report.soft_penalty for report in thermo_reports],
-            dtype=torch.float32,
-            device=device,
-        )
-        max_axial_stress_pa = torch.as_tensor(
-            [report.max_axial_stress_pa for report in thermo_reports],
-            dtype=torch.float32,
-            device=device,
-        )
-    else:
-        thermo_mech_penalty = torch.zeros((batch_size,), dtype=torch.float32, device=device)
-        max_axial_stress_pa = torch.zeros((batch_size,), dtype=torch.float32, device=device)
+    thermo = evaluate_thermo_mech_batch(cfg, temperature)
+    thermo_mech_penalty = thermo["soft_penalty"].to(dtype=torch.float32)
+    max_axial_stress_pa = thermo["max_axial_stress_pa"].to(dtype=torch.float32)
 
     max_temperature = torch.max(temperature, dim=1).values
     feasible = (

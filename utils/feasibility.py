@@ -140,3 +140,58 @@ def evaluate_feasibility(cfg, ring_radius: torch.Tensor) -> FeasibilityReport:
         area_ratio_violation=area_ratio_violation,
         soft_penalty=float(soft_penalty),
     )
+
+
+def evaluate_feasibility_batch(cfg, ring_radius: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Vectorized feasibility evaluation.
+
+    ring_radius: (B, R) or (R,)
+    Returns tensors shaped (B,)
+    """
+    if ring_radius.ndim == 1:
+        ring_radius = ring_radius.unsqueeze(0)
+    radius = torch.clamp(ring_radius.float(), min=1.0e-9)
+    batch_size, num_rings = radius.shape
+    diameter = 2.0 * radius
+    min_diameter = torch.amin(diameter, dim=1)
+    min_neck = float(getattr(cfg, "min_neck_diameter_m", 2.0 * cfg.min_radius))
+    neck_violation = torch.clamp(torch.as_tensor(min_neck, device=radius.device, dtype=radius.dtype) - min_diameter, min=0.0)
+
+    if num_rings > 1:
+        dz = float(cfg.height) / max(int(num_rings) - 1, 1)
+        slope = torch.abs(torch.diff(radius, dim=1) / max(dz, 1.0e-12))
+        max_slope = torch.amax(slope, dim=1)
+        slope_max = float(getattr(cfg, "feasibility_max_slope", 0.35))
+        slope_violation = torch.clamp(max_slope - float(slope_max), min=0.0)
+
+        area = math.pi * radius.pow(2)
+        area_ratio = area[:, 1:] / torch.clamp(area[:, :-1], min=1.0e-12)
+        area_ratio_clamped = torch.maximum(area_ratio, 1.0 / torch.clamp(area_ratio, min=1.0e-12))
+        worst_area_ratio = torch.amax(area_ratio_clamped, dim=1)
+        area_ratio_max = float(getattr(cfg, "feasibility_area_ratio_max", 5.0))
+        area_ratio_min = float(getattr(cfg, "feasibility_area_ratio_min", 0.20))
+        area_ratio_violation = torch.clamp(worst_area_ratio - float(area_ratio_max), min=0.0)
+        min_ratio = torch.amin(area_ratio, dim=1)
+        area_ratio_violation = torch.maximum(area_ratio_violation, torch.clamp(float(area_ratio_min) - min_ratio, min=0.0))
+    else:
+        max_slope = torch.zeros((batch_size,), dtype=radius.dtype, device=radius.device)
+        slope_violation = torch.zeros((batch_size,), dtype=radius.dtype, device=radius.device)
+        worst_area_ratio = torch.ones((batch_size,), dtype=radius.dtype, device=radius.device)
+        area_ratio_violation = torch.zeros((batch_size,), dtype=radius.dtype, device=radius.device)
+
+    soft_penalty = (
+        neck_violation / max(float(getattr(cfg, "min_neck_diameter_m", 1.0e-3)), 1.0e-12)
+        + slope_violation / max(float(getattr(cfg, "feasibility_max_slope", 0.35)), 1.0e-12)
+        + area_ratio_violation / max(float(getattr(cfg, "feasibility_area_ratio_max", 5.0)), 1.0e-12)
+    )
+    feasible = soft_penalty <= 1.0e-12
+    return {
+        "feasible": feasible,
+        "min_diameter_m": min_diameter,
+        "max_slope": max_slope,
+        "worst_area_ratio": worst_area_ratio,
+        "neck_violation": neck_violation,
+        "slope_violation": slope_violation,
+        "area_ratio_violation": area_ratio_violation,
+        "soft_penalty": soft_penalty,
+    }
