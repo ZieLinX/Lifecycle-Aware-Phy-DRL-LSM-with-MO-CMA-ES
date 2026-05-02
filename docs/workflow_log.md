@@ -797,3 +797,64 @@ C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_animation 
 - 当前 `r(z,theta)` 表示的是沿 z 轴单值半径场，天然不支持真正任意拓扑、端面起伏或内腔；若要允许顶/底面自由变形，至少要升级为端面可变的封闭 star-shaped surface，或转向 SDF/level-set 表示。
 - 题目中的外接球应建模为 0K、发射率 1 的吸收面；有效辐射目标应是能从器件表面到达外接球、处于 0-3 微米波段的净辐射功率。当前代码使用 `view_factor_proxy` 和遮挡 proxy，不是严格外接球可见性积分。
 - 最佳可落地方案应先做“封闭曲面 + 低阶 3D 策略场 + 体积投影 + 外接球可见性采样”，再考虑完整体素 SDF/level-set。
+
+## 18. full3d 后端：真 3D 物理规则修正
+
+### 18.1 用户要求
+
+用户明确要求修正所有物理规则，底线是必须真 3D：
+
+- 体积：通电前材料体积应固定。
+- 外界：外接球视为 0K、发射率 1 的吸收面。
+- 电极：电极必须保持 5mm 圆形。
+- 几何：顶面和底面也可以改变，不能只优化侧面。
+- 策略：上完整 3D U-Net/GNN 思路。
+
+### 18.2 实现内容
+
+- 新增 `utils/full3d_optimizer.py`。
+  - 使用封闭三维 mesh 表示几何。
+  - 侧面、顶面、底面都作为可优化表面。
+  - 两端 5mm 圆形电极边界固定直径和相对位置。
+  - `project_full3d_geometry()` 以闭合 mesh 体积为准，把通电前体积投影回初始圆柱体积。
+  - `evaluate_full3d_geometry()` 统计 0K、发射率 1 外接球吸收的 0-3 微米净辐射功率。
+  - 增加 `Full3DUNetGNNPolicy`：轻量 3D U-Net 编码器 + 图邻域平滑头，用于生成策略场。
+  - 导出 `optimized_full3d.stl/.stp`、`topology_evolution_full3d.gif/.mp4`、`run_summary_full3d.json`、`design_strategy_report_full3d.md`。
+- `optimize_3d.py`
+  - 新增 `--backend full3d|sidefield`，默认 `full3d`。
+  - `sidefield` 保留旧 `r(z,theta)` 路线以便对照。
+  - 新增 `--fixed-voltage`、`--cap-rings`、`--full3d-volume-tolerance`、`--full3d-neural-policy/--no-full3d-neural-policy`。
+- `config/cylinder_cfg.py`
+  - 增加 full3d 体积、电极、外接球和策略模型相关配置。
+- `tests/test_full3d_optimizer.py`
+  - 检查封闭 mesh 体积、电极误差、0K 外接球、U-Net/GNN 策略模型。
+  - 检查优化后顶/底面非电极区域确实发生位移，防止退回只动侧面的假 3D。
+- `tests/test_static_compile.py`
+  - 纳入 `utils/full3d_optimizer.py` 编译检查。
+- `docs/cloud_train_rtx4090_zh.md`
+  - 增加 full3d 默认后端和 RTX4090 命令。
+
+### 18.3 本地验证
+
+已通过：
+
+```bash
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_static_compile tests.test_full3d_optimizer
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe optimize_3d.py --backend full3d --device cpu --smoke --no-step --experiment-name full3d_smoke_check
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_full3d_optimizer tests.test_hybrid_optimizer_3d tests.test_physics_regression tests.test_static_compile
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe optimize_3d.py --backend sidefield --device cpu --smoke --no-step --experiment-name sidefield_compat_smoke
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_animation tests.test_exporter_resolution tests.test_feasibility tests.test_full3d_optimizer tests.test_hybrid_optimizer tests.test_hybrid_optimizer_3d tests.test_physics_regression tests.test_planner tests.test_static_compile tests.test_transient tests.test_vec_env
+```
+
+full3d smoke 结果：
+
+- 生成 `optimized_full3d.stl`
+- 生成 `topology_evolution_full3d.gif`
+- 本地环境生成 `topology_evolution_full3d.mp4`
+- `volume_change_ratio_full3d` 约 `2.8e-8`
+- `electrode_max_error_m` 约 `4e-19`
+- 顶/底面非电极区域发生位移
+- 100V 固定电压下当前候选温度超限，`feasible=False`，这是物理约束诊断，不再误标为可行
+- full3d/sidefield/physics/static 组合测试 13 项通过。
+- 旧 `--backend sidefield` CPU smoke 兼容通过。
+- 非长训练全量单元测试 25 项通过。

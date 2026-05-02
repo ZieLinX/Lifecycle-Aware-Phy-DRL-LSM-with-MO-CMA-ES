@@ -46,6 +46,39 @@ sudo apt-get install -y git tmux htop ffmpeg
 
 `ffmpeg` 建议装上，后面 MP4 导出更稳。
 
+### 1.3 `optimize_3d.py` full3d 默认后端
+
+最新代码中 `optimize_3d.py` 默认使用 `--backend full3d`：
+
+- 几何是封闭三维网格，不是轴对称剖面，也不是只优化侧面 `r(z,theta)`。
+- 侧面、顶面、底面都可以改变；两端 5mm 圆形电极边界保持直径和相对位置不变。
+- 通电前体积按封闭 mesh 体积投影回初始圆柱体积。
+- 有效辐射按 0K、发射率 1 的外接球吸收面统计 0-3 微米净辐射。
+- 策略生成器包含轻量 3D U-Net 编码器和图邻域平滑头。
+
+快速检查：
+
+```bash
+python -u optimize_3d.py --backend full3d --smoke --no-step --experiment-name full3d_smoke
+```
+
+正式跑：
+
+```bash
+mkdir -p logs
+python -u optimize_3d.py \
+  --backend full3d \
+  --experiment-name mcga_full3d_4090 \
+  --output-dir outputs/three_d_runs \
+  --generations 4 \
+  --population-size 16 \
+  --thermal-iters 640 \
+  --no-step \
+  2>&1 | tee -a logs/train_$(date +%F_%H%M%S).log
+```
+
+如果需要旧的侧面半径场路线，显式加 `--backend sidefield`。
+
 ### 2.2 安装 Miniconda（如未安装）
 
 ```bash

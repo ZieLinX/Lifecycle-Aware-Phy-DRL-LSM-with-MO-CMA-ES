@@ -18,6 +18,7 @@ class StaticCompileTest(unittest.TestCase):
             ROOT / "envs" / "cylinder_vec_env.py",
             ROOT / "config" / "cylinder_cfg.py",
             ROOT / "utils" / "exporter.py",
+            ROOT / "utils" / "full3d_optimizer.py",
             ROOT / "utils" / "hybrid_optimizer.py",
             ROOT / "utils" / "hybrid_optimizer_3d.py",
             ROOT / "utils" / "planner.py",

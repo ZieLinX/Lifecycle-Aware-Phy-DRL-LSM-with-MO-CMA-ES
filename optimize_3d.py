@@ -20,6 +20,14 @@ from utils.hybrid_optimizer_3d import (
     write_3d_strategy_report,
     _extract_metrics,
 )
+from utils.full3d_optimizer import (
+    export_full3d_animation,
+    export_full3d_mesh,
+    run_full3d_optimization,
+    save_full3d_history_csv,
+    save_full3d_summary,
+    write_full3d_report,
+)
 
 
 def _configure_cfg(args, eval_mode: bool = False):
@@ -34,9 +42,14 @@ def _configure_cfg(args, eval_mode: bool = False):
     cfg.hybrid3d_max_sigma = float(args.max_sigma)
     cfg.hybrid3d_max_log_delta = float(args.max_log_delta)
     cfg.hybrid3d_circum_penalty = float(args.circum_penalty)
+    cfg.full3d_use_neural_policy = bool(args.full3d_neural_policy)
+    cfg.full3d_fixed_voltage_v = float(args.fixed_voltage)
+    cfg.full3d_volume_tolerance_ratio = float(args.full3d_volume_tolerance)
+    cfg.full3d_cap_rings = int(args.cap_rings)
     if args.smoke:
         cfg.num_segments = 32 if not eval_mode else 48
         cfg.num_rings = 24 if not eval_mode else 48
+        cfg.full3d_cap_rings = min(int(cfg.full3d_cap_rings), 5)
         cfg.voltage_grid_points = 5
         cfg.voltage_refine_levels = 1
         cfg.voltage_refine_points = 5
@@ -44,6 +57,69 @@ def _configure_cfg(args, eval_mode: bool = False):
         cfg.transient_max_time_s = 8.0
         cfg.transient_dt_s = 1.0
     return cfg
+
+
+def _run_full3d_backend(args) -> None:
+    train_cfg = _configure_cfg(args, eval_mode=False)
+    output_dir = Path(args.output_dir) / f"{args.experiment_name}_{datetime.now().strftime('%m-%d-%H-%M')}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    result = run_full3d_optimization(
+        train_cfg,
+        generations=int(args.generations),
+        population_size=int(args.population_size),
+        seed=int(args.seed),
+        use_neural_policy=bool(args.full3d_neural_policy),
+    )
+    export_info = export_full3d_mesh(
+        result.best_geometry,
+        train_cfg,
+        output_dir=output_dir,
+        output_name="optimized_full3d",
+        export_step=not bool(args.no_step),
+    )
+    anim_info = export_full3d_animation(
+        result.history_geometries,
+        result.history_metrics,
+        output_dir=output_dir,
+        output_name="topology_evolution_full3d",
+    )
+    base_power = max(float(result.baseline_metrics.get("net_radiated_power_0k_sphere_w", 0.0)), 1.0e-9)
+    final_power = float(result.best_metrics.get("net_radiated_power_0k_sphere_w", 0.0))
+    summary = {
+        "method": "full3d_unet_gnn_policy_closed_mesh_0k_sphere",
+        "backend": "full3d",
+        "device": args.device,
+        "candidate_count": int(result.candidate_count),
+        "num_segments": int(train_cfg.num_segments),
+        "num_rings": int(train_cfg.num_rings),
+        "cap_rings": int(train_cfg.full3d_cap_rings),
+        "top_bottom_faces_variable": True,
+        "electrode_constraint": "two 5 mm circular electrode boundaries remain fixed in diameter and relative position",
+        "volume_constraint": "pre-energization closed-mesh volume is projected to the initial cylinder volume",
+        "external_sphere": "0 K blackbody sphere, emissivity 1, receives escaped 0-3 um radiation",
+        "policy_model": "lightweight 3D U-Net encoder with graph-neighborhood smoothing head",
+        "baseline_net_radiated_power_0k_sphere_w": base_power,
+        "final_net_radiated_power_0k_sphere_w": final_power,
+        "power_ratio_full3d": final_power / base_power,
+        "baseline_lifetime_s_full3d": float(result.baseline_metrics.get("lifetime_s", 0.0)),
+        "final_lifetime_s_full3d": float(result.best_metrics.get("lifetime_s", 0.0)),
+        "lifetime_ratio_full3d": float(result.best_metrics.get("lifetime_ratio_3d", 0.0)),
+        "volume_change_ratio_full3d": float(result.best_metrics.get("volume_change_ratio_3d", 0.0)),
+        "electrode_max_error_m": float(result.best_metrics.get("electrode_max_error_m", 0.0)),
+        "effective_radiating_area_m2": float(result.best_metrics.get("effective_radiating_area_m2", 0.0)),
+        "escape_view_factor_proxy": float(result.best_metrics.get("escape_view_factor_proxy", 0.0)),
+        "max_temperature_k": float(result.best_metrics.get("max_temperature_k", 0.0)),
+        "temperature_violation_ratio": float(result.best_metrics.get("temperature_violation_ratio", 0.0)),
+        "feasible": bool(result.best_metrics.get("constraint_feasible_3d", False)),
+        **export_info,
+        **anim_info,
+    }
+    save_full3d_history_csv(output_dir, result.history_metrics)
+    save_full3d_summary(output_dir, summary)
+    report = write_full3d_report(output_dir, result, summary)
+    print(f"[3d] artifacts saved to: {output_dir}", flush=True)
+    print(f"[3d] report: {report}", flush=True)
+    print(summary, flush=True)
 
 
 def _select_eval_candidate(eval_cfg, result: Hybrid3DResult):
@@ -200,6 +276,7 @@ def _build_summary(args, eval_cfg, result, baseline, final, selected_idx, artifa
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run true 3D surface optimization for the tungsten cylinder task.")
+    parser.add_argument("--backend", choices=("full3d", "sidefield"), default="full3d", help="full3d uses a closed mesh with movable end faces; sidefield keeps legacy r(z,theta) side-field behavior.")
     parser.add_argument("--output-dir", type=str, default="outputs/three_d_runs")
     parser.add_argument("--experiment-name", type=str, default="mcga_3d_sota")
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -217,6 +294,10 @@ def main() -> None:
     parser.add_argument("--max-log-delta", type=float, default=0.160, help="Clamp log radius perturbations to +/- this value before projection.")
     parser.add_argument("--circum-penalty", type=float, default=0.35, help="Score penalty weight for circumferential nonuniformity.")
     parser.add_argument("--freecad-timeout", type=float, default=90.0, help="Seconds to wait for FreeCAD STEP export before falling back to STL only.")
+    parser.add_argument("--fixed-voltage", type=float, default=100.0, help="Voltage for the full3d closed-mesh backend, matching the task statement.")
+    parser.add_argument("--cap-rings", type=int, default=8, help="Radial discretization rings per movable end face for full3d backend.")
+    parser.add_argument("--full3d-volume-tolerance", type=float, default=1.0e-5, help="Closed-mesh volume tolerance for full3d feasibility.")
+    parser.add_argument("--full3d-neural-policy", action=argparse.BooleanOptionalAction, default=True, help="Use the lightweight 3D U-Net/GNN strategy generator in full3d backend.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-step", action="store_true")
     parser.add_argument("--smoke", action="store_true")
@@ -230,6 +311,10 @@ def main() -> None:
         args.population_size = min(int(args.population_size), 8)
         args.axial_modes = min(int(args.axial_modes), 3)
         args.circum_modes = min(int(args.circum_modes), 1)
+
+    if args.backend == "full3d":
+        _run_full3d_backend(args)
+        return
 
     train_cfg = _configure_cfg(args, eval_mode=False)
     eval_cfg = _configure_cfg(args, eval_mode=True)

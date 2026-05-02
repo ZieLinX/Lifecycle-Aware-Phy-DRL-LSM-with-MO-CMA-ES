@@ -202,6 +202,20 @@ class CylinderPhysicsCfg:
     hybrid3d_max_log_delta = 0.160
     hybrid3d_circum_penalty = 0.35
 
+    # Full closed-geometry 3D backend. Unlike the legacy side-field backend,
+    # this allows the side wall and both end faces to move while preserving the
+    # two 5 mm circular electrode boundaries.
+    full3d_cap_rings = 8
+    full3d_radial_modes = 3
+    full3d_cap_max_displacement_m = 4.0e-4
+    full3d_volume_tolerance_ratio = 1.0e-5
+    full3d_electrode_tolerance_m = 2.0e-6
+    full3d_fixed_voltage_v = 100.0
+    full3d_sphere_temperature_k = 0.0
+    full3d_sphere_emissivity = 1.0
+    full3d_escape_floor = 0.10
+    full3d_use_neural_policy = True
+
     # Export settings
     freecad_cmd = ""
     freecad_timeout_s = 90.0
