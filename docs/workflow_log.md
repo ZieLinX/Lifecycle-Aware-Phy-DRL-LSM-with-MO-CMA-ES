@@ -614,3 +614,39 @@ python -u optimize_3d.py --smoke --experiment-name freecad_check_step --freecad-
   - `design_strategy_report_3d.md`
 - `stp=None`：FreeCAD 超时后的预期结果。
 - `mp4=None`：仍是视频编码器链路问题，不影响 GIF 和核心 3D 产物。
+
+## 15. RTX4090 正式 3D 命令参数缺值记录
+
+### 15.1 用户反馈
+
+用户执行正式 3D 优化命令时写成：
+
+```bash
+python -u optimize_3d.py --experiment-name mcga_3d_4090 --output-dir outputs/three_d_runs --generations 4 --population-size 16 --axial-modes 4 --circum-modes 2 --thermal-iters 2>&1 | tee -a logs/train_$(date +%F_%H%M%S).log
+```
+
+报错：
+
+```text
+optimize_3d.py: error: argument --thermal-iters: expected one argument
+```
+
+原因：`--thermal-iters` 后面必须跟整数；当前命令里 `--thermal-iters` 后直接进入 shell 重定向 `2>&1`，所以 argparse 认为该参数缺值。
+
+### 15.2 推荐命令
+
+正式 3D 优化建议继续跳过 STEP，使用：
+
+```bash
+mkdir -p logs
+python -u optimize_3d.py \
+  --experiment-name mcga_3d_4090 \
+  --output-dir outputs/three_d_runs \
+  --generations 4 \
+  --population-size 16 \
+  --axial-modes 4 \
+  --circum-modes 2 \
+  --thermal-iters 640 \
+  --no-step \
+  2>&1 | tee -a logs/train_$(date +%F_%H%M%S).log
+```
