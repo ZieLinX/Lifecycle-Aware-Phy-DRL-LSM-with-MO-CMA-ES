@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import math
 import unittest
+from unittest import mock
 
 import torch
 
 from config.cylinder_cfg import CylinderPhysicsCfg, make_eval_cfg
 from envs.cylinder_env import CylinderPhysicsEnv
+from utils import rated_condition
 from utils.rated_condition import search_rated_condition
 
 
@@ -55,6 +57,19 @@ class PhysicsRegressionTest(unittest.TestCase):
             cfg.height / max(cfg.num_rings - 1, 1),
         )
         self.assertLessEqual(dx, 1.01e-4)
+
+    def test_blackbody_band_fraction_supports_old_numpy(self) -> None:
+        rated_condition._blackbody_band_fraction_cached.cache_clear()
+        with mock.patch.object(rated_condition.np, "trapezoid", None, create=True), mock.patch.object(
+            rated_condition.np,
+            "trapz",
+            None,
+            create=True,
+        ):
+            value = rated_condition.blackbody_band_fraction(3000.0, 3.0)
+        self.assertTrue(math.isfinite(value))
+        self.assertGreaterEqual(value, 0.0)
+        self.assertLessEqual(value, 1.0)
 
 
 if __name__ == "__main__":

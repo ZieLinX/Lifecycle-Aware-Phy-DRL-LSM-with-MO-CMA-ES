@@ -456,3 +456,35 @@ C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe optimize_3d.py --device cpu --smo
 - `design_strategy_report_3d.md`
 
 该 smoke 用 CPU 和极小参数，仅验证导出链，不代表优化质量。4090 Ubuntu 上应使用 `--device cuda:0` 和更高 `generations/population-size/thermal-iters`。
+
+## 12. RTX4090 smoke 报错修复：兼容旧 NumPy 无 `np.trapezoid`
+
+### 12.1 用户反馈
+
+用户在 RTX4090 Ubuntu 服务器先跑 `train_rl.py --smoke`，启动阶段在 `utils/rated_condition.py` 的黑体光谱带积分处失败：
+
+```text
+AttributeError: module 'numpy' has no attribute 'trapezoid'
+```
+
+根因：服务器环境 NumPy 版本较旧，提供 `np.trapz` 但没有较新的 `np.trapezoid` API。
+
+### 12.2 修复
+
+- 在 `utils/rated_condition.py` 新增 `_trapezoid_integral()`：
+  - 优先使用 `np.trapezoid`
+  - 旧 NumPy 回退到 `np.trapz`
+  - 如果两者都不存在，再使用本地梯形积分实现
+- 将 `_blackbody_band_fraction_cached()` 中两处 `np.trapezoid(...)` 改为 `_trapezoid_integral(...)`。
+- 在 `tests/test_physics_regression.py` 增加旧 NumPy 兼容测试，模拟 `np.trapezoid` / `np.trapz` 都不可用时仍能计算黑体带积分。
+
+### 12.3 验证
+
+已通过：
+
+```bash
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_physics_regression tests.test_static_compile tests.test_vec_env
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_animation tests.test_exporter_resolution tests.test_feasibility tests.test_hybrid_optimizer tests.test_hybrid_optimizer_3d tests.test_physics_regression tests.test_planner tests.test_static_compile tests.test_transient tests.test_vec_env
+```
+
+结果：第一次 8 项通过；第二次 20 项非长训练测试通过。
