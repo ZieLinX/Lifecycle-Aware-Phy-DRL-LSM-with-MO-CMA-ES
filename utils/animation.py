@@ -14,6 +14,24 @@ import numpy as np
 _MB = 16
 
 
+def _metric_float(metrics: dict, *keys: str, default: float = 0.0) -> float:
+    for key in keys:
+        if key not in metrics:
+            continue
+        try:
+            return float(metrics[key])
+        except (TypeError, ValueError):
+            continue
+    return float(default)
+
+
+def _metric_value(metrics: dict, *keys: str, default=True):
+    for key in keys:
+        if key in metrics:
+            return metrics[key]
+    return default
+
+
 def _align_frame(img: np.ndarray, block: int = _MB) -> np.ndarray:
     """Pad image height/width to the nearest multiple of `block` for video codecs."""
     h, w = img.shape[:2]
@@ -44,14 +62,14 @@ def _render_frame(
     ax.set_ylim(-max_radius_mm * 1.08, max_radius_mm * 1.08)
     ax.set_xlabel("Axial position z (mm)")
     ax.set_ylabel("Radius (mm)")
-    ax.set_title("Cylinder Topology Evolution", fontsize=12)
+    ax.set_title("Axisymmetric Ring-Profile Evolution", fontsize=12)
     stats_text = "\n".join(
         [
             f"step = {metrics.get('step', step_idx)}",
-            f"V*   = {metrics.get('rated_voltage_v', 0.0):.2f} V",
-            f"P₀₋₃ = {metrics.get('radiation_power', metrics.get('initial_net_band_power_w', 0.0)):.3f} W",
-            f"life = {metrics.get('lifetime_ratio', 1.0):.3f}",
-            f"feasible = {metrics.get('feasible', True)}",
+            f"V*   = {_metric_float(metrics, 'voltage_v', 'rated_voltage_v'):.2f} V",
+            f"P₀₋₃ = {_metric_float(metrics, 'initial_net_band_power_w', 'radiation_power', 'adjusted_initial_power_w'):.3f} W",
+            f"life = {_metric_float(metrics, 'lifetime_ratio', 'adjusted_lifetime_ratio', default=1.0):.3f}",
+            f"feasible = {_metric_value(metrics, 'feasible', 'constraint_feasible_3d', default=True)}",
         ]
     )
     ax.text(
@@ -144,10 +162,10 @@ def save_realtime_frame(
     ax.set_ylabel("radius (mm)")
     title_info = (
         f"step={step_idx}  "
-        f"V*={metrics.get('rated_voltage_v', 0.0):.1f}V  "
-        f"P0-3={metrics.get('initial_net_band_power_w', 0.0):.2f}W  "
-        f"life={metrics.get('lifetime_ratio', 1.0):.3f}  "
-        f"feasible={metrics.get('feasible', True)}"
+        f"V*={_metric_float(metrics, 'voltage_v', 'rated_voltage_v'):.1f}V  "
+        f"P0-3={_metric_float(metrics, 'initial_net_band_power_w', 'radiation_power', 'adjusted_initial_power_w'):.2f}W  "
+        f"life={_metric_float(metrics, 'lifetime_ratio', 'adjusted_lifetime_ratio', default=1.0):.3f}  "
+        f"feasible={_metric_value(metrics, 'feasible', 'constraint_feasible_3d', default=True)}"
     )
     ax.set_title(title_info, fontsize=9)
     fig.tight_layout()

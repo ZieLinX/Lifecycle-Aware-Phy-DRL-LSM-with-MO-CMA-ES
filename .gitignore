@@ -1,4 +1,5 @@
 __pycache__/
 *.pyc
 outputs/
+RTX4090/
 docs/_xlsx_export/

@@ -262,6 +262,23 @@ def _write_rollout_artifacts(output_dir: Path, history: list[dict], summary: dic
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
 
+def _lifetime_ratio(metrics: dict, baseline: dict) -> float:
+    return float(metrics["lifetime_s"] / max(float(baseline["lifetime_s"]), 1.0e-9))
+
+
+def _constraint_status(metrics: dict, cfg) -> tuple[bool, list[str]]:
+    reasons = []
+    if float(metrics["feature_change_ratio"]) >= float(cfg.feature_fail_ratio):
+        reasons.append("feature_change_ratio")
+    if float(metrics["max_temperature_k"]) > float(cfg.max_temp):
+        reasons.append("max_temperature_k")
+    if float(metrics["volume_change_ratio"]) > float(cfg.volume_tolerance_ratio):
+        reasons.append("volume_change_ratio")
+    if float(metrics.get("lifetime_ratio", 1.0)) < float(cfg.minimum_lifetime_ratio):
+        reasons.append("minimum_lifetime_ratio")
+    return len(reasons) == 0, reasons
+
+
 def _run_final_evaluation(base_config: dict, checkpoint_path: Path, args):
     coarse_cfg = deepcopy(base_config["params"]["config"]["env_config"]["cfg"])
     coarse_cfg.device = "cuda:0"
@@ -303,7 +320,11 @@ def _run_final_evaluation(base_config: dict, checkpoint_path: Path, args):
     eval_env = CylinderVecEnv(eval_cfg, num_envs=1)
     obs, _ = eval_env.reset()
     ring_history = [eval_env.ring_radius[0].detach().cpu().numpy().copy()]
-    metrics_history = [_extract_metric(eval_env.current_metrics, 0)]
+    baseline_metrics = _extract_metric(eval_env.current_metrics, 0)
+    baseline_metrics["step"] = 0
+    baseline_metrics["lifetime_ratio"] = 1.0
+    baseline_metrics["geometry_mode"] = "axisymmetric_ring_profile"
+    metrics_history = [baseline_metrics]
     rollout_history = []
     step_idx = 0
     done = False
@@ -312,9 +333,11 @@ def _run_final_evaluation(base_config: dict, checkpoint_path: Path, args):
         done = bool(terminated[0] or truncated[0])
         step_idx += 1
         metrics = _extract_metric(eval_env.current_metrics, 0)
+        metrics["lifetime_ratio"] = _lifetime_ratio(metrics, metrics_history[0])
         metrics.update(
             {
                 "step": step_idx,
+                "geometry_mode": "axisymmetric_ring_profile",
                 "reward": float(reward[0]),
                 "score": float(info["score"][0]),
                 "dwell_time_s": float(info["dwell_time_s"][0]),
@@ -351,10 +374,14 @@ def _run_final_evaluation(base_config: dict, checkpoint_path: Path, args):
     )
     baseline = metrics_history[0]
     final = metrics_history[-1]
+    constraint_feasible, termination_reasons = _constraint_status(final, eval_cfg)
+    radius_delta = ring_history[-1] - ring_history[0]
     summary = {
         "checkpoint": str(checkpoint_path),
         "device": "cuda:0",
         "grid_mode": "evaluation",
+        "geometry_mode": "axisymmetric_ring_profile",
+        "physics_mode": "axisymmetric_1d_rated_condition",
         "num_segments": int(eval_cfg.num_segments),
         "num_rings": int(eval_cfg.num_rings),
         "steps": int(step_idx),
@@ -366,18 +393,24 @@ def _run_final_evaluation(base_config: dict, checkpoint_path: Path, args):
         "final_average_power_w": float(final["average_net_band_power_w"]),
         "baseline_lifetime_s": float(baseline["lifetime_s"]),
         "final_lifetime_s": float(final["lifetime_s"]),
+        "minimum_lifetime_ratio": float(eval_cfg.minimum_lifetime_ratio),
         "baseline_max_temp_k": float(baseline["max_temperature_k"]),
         "final_max_temp_k": float(final["max_temperature_k"]),
         "initial_power_ratio": float(final["initial_net_band_power_w"] / max(float(baseline["initial_net_band_power_w"]), 1.0e-9)),
         "average_power_ratio": float(final["average_net_band_power_w"] / max(float(baseline["average_net_band_power_w"]), 1.0e-9)),
-        "lifetime_ratio": float(final["lifetime_s"] / max(float(baseline["lifetime_s"]), 1.0e-9)),
+        "lifetime_ratio": _lifetime_ratio(final, baseline),
         "feature_change_ratio": float(final["feature_change_ratio"]),
         "volume_change_ratio": float(final["volume_change_ratio"]),
         "final_optimal_transient_time_s": float(final.get("optimal_transient_time_s", 0.0)),
         "final_transient_power_w": float(final.get("transient_power_w", 0.0)),
         "final_transient_mean_power_w": float(final.get("transient_mean_power_w", 0.0)),
         "final_transient_objective": float(final.get("transient_objective", 0.0)),
-        "feasible": bool(final["feasible"]),
+        "rated_feasible": bool(final["feasible"]),
+        "constraint_feasible": bool(constraint_feasible),
+        "termination_reasons": termination_reasons,
+        "feasible": bool(constraint_feasible),
+        "max_radius_delta_mm": float(np.max(np.abs(radius_delta)) * 1.0e3),
+        "mean_abs_radius_delta_mm": float(np.mean(np.abs(radius_delta)) * 1.0e3),
         "gif": animation_info["gif"],
         "mp4": animation_info["mp4"],
         "stl": export_info["stl"],

@@ -155,6 +155,8 @@ class CylinderPhysicsCfg:
     reward_weight_initial_power = 1.15
     reward_weight_average_power = 1.00
     reward_weight_lifetime = 0.45
+    reward_lifetime_ratio_cap = 5.0
+    observation_lifetime_ratio_cap = 5.0
     reward_weight_uniformity = 0.20
     reward_weight_efficiency = 0.10
     reward_weight_transient_power = 0.35

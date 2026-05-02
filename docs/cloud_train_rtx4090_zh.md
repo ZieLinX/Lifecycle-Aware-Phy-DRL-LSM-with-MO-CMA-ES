@@ -1,55 +1,52 @@
-# 云服务器（RTX4090）训练教程（SSH 版）
+# RTX4090 Ubuntu 服务器训练文档
 
-本教程面向：你将租用一台可 SSH 登录的 RTX4090 Linux 服务器，在其上配置环境、拉取本仓库 `xzh` 分支（含实时进度条/日志），并用进程守护长期运行训练。
+这份文档面向可 SSH 登录的 Ubuntu RTX4090 服务器，按当前仓库脚本说明如何安装环境、运行训练、查看日志和回收产物。  
+仓库里有两条路线，必须分开理解：
 
-## 0. 约定与目标
+1. `train_rl.py` 是**轴对称 RL 路线**，训练的是 ring profile / 剖面策略。
+2. `optimize_3d.py` 是**真 3D 路线**，直接优化 `r(z, theta)` 三维半径场。
 
-- 目标：在 **GPU（cuda）** 上运行 `train_rl.py` 的正式训练，且持续输出训练进度（epoch/fps）与实时关键指标（每 N 步打印一次）。
-- 产物目录：
-  - 训练：`outputs/rl_runs/<experiment>_<stamp>/`
-  - 训练快照（实时形状）：`outputs/rl_runs/<experiment>_<stamp>/realtime/`
-  - 训练结束自动生成训练演化：`training_evolution.gif/.mp4`（若编码器可用）
-  - 最终评估：`outputs/final_eval/<experiment>_<stamp>/`（含 `run_summary.json`、`rollout_metrics.csv`、`optimized_cylinder.stl/.stp`、`topology_evolution.gif/.mp4`）
+## 1. 两条路线和产物
 
-## 1. 服务器侧准备（一次性）
+### 1.1 `train_rl.py` 轴对称 RL 路线
 
-### 1.1 登录与基础工具
+- 训练目录默认是 `outputs/rl_runs/<experiment>_<stamp>/`
+- 训练中实时快照会写到 `outputs/rl_runs/<experiment>_<stamp>/realtime/`
+- 训练结束后会自动做最终评估，产物落到 `outputs/final_eval/<run>/`
+- 关键产物：
+  - `run_summary.json`
+  - `rollout_metrics.csv`
+  - `optimized_cylinder.stl`
+  - `optimized_cylinder.stp`（需要 FreeCAD CLI 才能生成）
+  - `topology_evolution.gif`
+  - `topology_evolution.mp4`（本机编码器可用时才会生成）
 
-```bash
-ssh <user>@<host>
-```
+训练过程里的实时动画文件名是 `training_evolution.gif/.mp4`，它在 `realtime/` 目录里，不是最终评估产物。
 
-建议安装常用工具：
+### 1.2 `optimize_3d.py` 真 3D 路线
+
+- 输出目录默认是 `outputs/three_d_runs/<experiment>_<stamp>/`
+- 关键产物：
+  - `topology_evolution_3d.gif`
+  - `topology_evolution_3d.mp4`（`ffmpeg/libx264` 可用时生成，否则可能是 `null`）
+  - `optimized_cylinder_3d.stl`
+  - `optimized_cylinder_3d.stp`（可选，依赖 FreeCAD）
+  - `optimization_history_3d.csv`
+  - `run_summary_3d.json`
+  - `design_strategy_report_3d.md`
+
+## 2. 服务器环境准备
+
+### 2.1 基础工具
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git tmux htop
+sudo apt-get install -y git tmux htop ffmpeg
 ```
 
-### 1.2 驱动与 CUDA
+`ffmpeg` 建议装上，后面 MP4 导出更稳。
 
-- RTX4090 建议使用较新的 NVIDIA Driver（例如 535+）。
-- 只要驱动正常，PyTorch 轮子自带 CUDA runtime，通常**不需要**你单独安装完整 CUDA Toolkit。
-
-验证 GPU：
-
-```bash
-nvidia-smi
-```
-
-## 2. 拉取代码（xzh 分支）
-
-```bash
-mkdir -p ~/work && cd ~/work
-git clone <你的仓库地址> make_cylinder_great_again
-cd make_cylinder_great_again
-git checkout xzh
-git pull
-```
-
-## 3. 创建 Python 环境（推荐 conda）
-
-### 3.1 安装 Miniconda（若无）
+### 2.2 安装 Miniconda（如未安装）
 
 ```bash
 cd ~
@@ -59,120 +56,237 @@ echo 'export PATH="$HOME/miniconda3/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
 ```
 
-### 3.2 创建环境并安装依赖
+### 2.3 创建 conda 环境
 
 ```bash
 conda create -n mcga_4090 python=3.10 -y
 conda activate mcga_4090
 ```
 
-安装 PyTorch（建议 cu121，适配 4090，更常见）：
+### 2.4 安装 PyTorch CUDA 版
+
+RTX4090 推荐直接装 CUDA 轮子，不单独装完整 CUDA Toolkit：
 
 ```bash
 pip install --upgrade pip
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 ```
 
-安装训练/数值/可视化依赖：
+### 2.5 安装仓库依赖
 
 ```bash
-pip install rl-games gymnasium numpy scipy pyyaml tensorboard matplotlib imageio
+pip install rl-games gymnasium numpy scipy pyyaml tensorboard matplotlib imageio imageio-ffmpeg
 ```
 
-可选（如果你要导出 STEP/STP）：
-- 服务器若无 GUI，建议只导出 STL（`--no-step` 相关参数在优化脚本里；RL final eval 当前默认会尝试导出 STEP，需要 FreeCAD CLI 才会生成 STP）。
+`imageio-ffmpeg` 建议一起装，GIF/MP4 导出更稳。
 
-验证 CUDA 可用：
+### 2.6 可选：FreeCAD / STEP
+
+如果你需要 `.stp/.step`，再额外准备 FreeCAD CLI。没有 FreeCAD 也能正常训练，区别只是 STP 可能不会生成。  
+在真 3D 命令里也可以直接加 `--no-step` 跳过 STEP 导出。
+
+### 2.7 验证 GPU
 
 ```bash
-python -c "import torch; print(torch.__version__); print('cuda', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none')"
+nvidia-smi
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no-gpu')"
 ```
 
-## 4. 开始训练（带实时进度条与实时关键指标）
+## 3. 拉取代码
 
-### 4.1 推荐启动命令
+```bash
+mkdir -p ~/work
+cd ~/work
+git clone <你的仓库地址> make_cylinder_great_again
+cd make_cylinder_great_again
+```
 
-- `--console-interval`：每 N 个 RL step 打印一次关键指标（电压/功率/寿命比/可行性）。
-- `--realtime-interval`：每 N 个 RL step 保存一次形状快照（训练结束会自动合成训练演化动图）。
+如果你在指定分支上工作，再切到对应分支即可。
 
-示例（正式训练）：
+## 4. 推荐执行顺序
+
+建议按这个顺序跑：
+
+1. 先跑 `train_rl.py --smoke`，确认 GPU、依赖、导出链路都通。
+2. 再跑 `optimize_3d.py` 正式优化。
+3. `train_rl.py` 的正式 RL 训练命令保留作对照和补充实验。
+
+### 4.1 先跑 smoke
+
+RL 路线 smoke：
+
+```bash
+python -u train_rl.py --smoke --experiment-name mcga_phy_drl_4090_smoke
+```
+
+真 3D 路线 smoke：
+
+```bash
+python -u optimize_3d.py --smoke --no-step --experiment-name mcga_3d_4090_smoke
+```
+
+### 4.2 再跑 3D 正式优化
+
+```bash
+python -u optimize_3d.py \
+  --experiment-name mcga_3d_4090 \
+  --output-dir outputs/three_d_runs \
+  --generations 4 \
+  --population-size 16 \
+  --axial-modes 4 \
+  --circum-modes 2 \
+  --thermal-iters 640 \
+  --no-step
+```
+
+### 4.3 保留 RL 正式训练命令作对照
 
 ```bash
 python -u train_rl.py \
   --experiment-name mcga_phy_drl_4090 \
   --max-epochs 400 \
   --num-actors 16 \
-  --realtime-interval 2 \
-  --console-interval 10
+  --realtime-interval 4 \
+  --console-interval 20
 ```
 
-### 4.2 你将看到的实时输出
+如果显存紧张，先把 `--num-actors` 降到 8，再看效果。
 
-- rl_games 的周期输出（epoch/fps/frames）类似：
-  - `fps step: ... epoch: k/N frames: ...`
-- 本仓库新增的实时关键指标输出类似：
-  - `[rl] step=10 V*=... P0-3=...W life=... feasible=True/False`
-- 若 `tqdm` 可用，还会显示 `[rl] training` 的进度条（按 epoch 递增）。
+## 5. 长任务运行方式
 
-## 5. 进程守护（推荐 tmux）
-
-### 5.1 使用 tmux（最推荐）
+### 5.1 用 tmux
 
 ```bash
-tmux new -s mcga
+tmux new -s mcga4090
 conda activate mcga_4090
 cd ~/work/make_cylinder_great_again
-python -u train_rl.py --experiment-name mcga_phy_drl_4090 --max-epochs 400 --num-actors 16 --realtime-interval 2 --console-interval 10
+python -u optimize_3d.py \
+  --experiment-name mcga_3d_4090 \
+  --output-dir outputs/three_d_runs \
+  --generations 4 \
+  --population-size 16 \
+  --axial-modes 4 \
+  --circum-modes 2 \
+  --thermal-iters 640 \
+  --no-step
 ```
 
-脱离会话（不中断进程）：按 `Ctrl+b` 再按 `d`。
-
-回到会话：
+断开会话但不中断任务：
 
 ```bash
-tmux attach -t mcga
+Ctrl+b
+d
 ```
 
-查看会话列表：
+恢复会话：
+
+```bash
+tmux attach -t mcga4090
+```
+
+查看会话：
 
 ```bash
 tmux ls
 ```
 
-### 5.2 使用 nohup（备选）
+### 5.2 用 nohup
 
 ```bash
 conda activate mcga_4090
 cd ~/work/make_cylinder_great_again
-nohup python -u train_rl.py --experiment-name mcga_phy_drl_4090 --max-epochs 400 --num-actors 16 --realtime-interval 2 --console-interval 10 > train_4090.log 2>&1 &
-tail -f train_4090.log
+nohup python -u optimize_3d.py --experiment-name mcga_3d_4090 --output-dir outputs/three_d_runs --generations 4 --population-size 16 --axial-modes 4 --circum-modes 2 --thermal-iters 640 --no-step > 3d_4090.log 2>&1 &
+tail -f 3d_4090.log
 ```
 
-## 6. 训练结束后检查产物
+RL 路线也可以同样方式跑，只是命令换成 `train_rl.py`。
 
-```bash
-ls -lah outputs/rl_runs
-ls -lah outputs/final_eval
-```
+## 6. 日志和产物怎么看
 
-你关心的关键文件：
+### 6.1 RL 路线
+
+训练日志主要看控制台或你重定向出来的 `train_rl.log`。训练目录和最终评估目录分别是：
+
+- `outputs/rl_runs/<experiment>_<stamp>/`
+- `outputs/final_eval/<run>/`
+
+常看文件：
+
+- `outputs/rl_runs/<run>/realtime/training_evolution.gif`
+- `outputs/rl_runs/<run>/realtime/training_evolution.mp4`
 - `outputs/final_eval/<run>/run_summary.json`
 - `outputs/final_eval/<run>/rollout_metrics.csv`
-- `outputs/final_eval/<run>/optimized_cylinder.stl`（以及可能的 `.stp`）
-- `outputs/final_eval/<run>/topology_evolution.gif/.mp4`
-- `outputs/rl_runs/<run>/realtime/training_evolution.gif/.mp4`（训练过程演化）
+- `outputs/final_eval/<run>/optimized_cylinder.stl`
+- `outputs/final_eval/<run>/topology_evolution.gif`
+- `outputs/final_eval/<run>/topology_evolution.mp4`
 
-## 7. 常见问题排查
+### 6.2 真 3D 路线
 
-### 7.1 看不到进度条/输出很慢
-- 确保使用 `python -u train_rl.py ...`（关闭缓冲）。
-- 若使用 `conda run ...`，部分环境会出现输出缓冲或启动很慢，建议进入环境后直接运行 `python`。
+输出目录默认类似：
 
-### 7.2 CUDA 不可用
-- 先 `nvidia-smi` 看驱动是否正常。
-- 再检查 `pip show torch` 与安装的 CUDA 轮子是否正确（cu121）。
+- `outputs/three_d_runs/<experiment>_<stamp>/`
 
-### 7.3 4090 上显存不够
-- 降低 `--num-actors`（例如 16 -> 8）。
-- 也可调整 `config/rl_games_ppo.yaml` 里的 `minibatch_size` / `horizon_length`。
+常看文件：
 
+- `outputs/three_d_runs/<run>/topology_evolution_3d.gif`
+- `outputs/three_d_runs/<run>/topology_evolution_3d.mp4`
+- `outputs/three_d_runs/<run>/optimized_cylinder_3d.stl`
+- `outputs/three_d_runs/<run>/optimized_cylinder_3d.stp`
+- `outputs/three_d_runs/<run>/optimization_history_3d.csv`
+- `outputs/three_d_runs/<run>/run_summary_3d.json`
+- `outputs/three_d_runs/<run>/design_strategy_report_3d.md`
+
+## 7. 如果 MP4 没出来
+
+如果 `mp4` 显示 `null`、没生成，先看同目录下的 GIF。  
+这通常说明编码器不可用，优先这样处理：
+
+1. 确认已经安装 `ffmpeg`
+2. 确认已经安装 `imageio-ffmpeg`
+3. 再重跑一次训练或 3D 优化，或者把已有 GIF 后处理成 MP4
+
+真 3D 路线和 RL 路线都遵循同样逻辑：
+
+- GIF 基本一定会有
+- MP4 依赖本机视频编码能力，`libx264` 不可用时可能不写出
+
+## 8. 拉回服务器上的产物
+
+建议把回收来的日志和产物都放进本地仓库根目录下的 `RTX4090/`。这个目录只用于**复制回来的结果**，不应该作为代码提交内容。
+
+示例：
+
+```bash
+mkdir -p RTX4090
+scp -r <user>@<host>:~/work/make_cylinder_great_again/outputs/final_eval/<run> RTX4090/
+scp -r <user>@<host>:~/work/make_cylinder_great_again/outputs/three_d_runs/<run> RTX4090/
+scp <user>@<host>:~/work/make_cylinder_great_again/3d_4090.log RTX4090/
+```
+
+仓库里已经把 `RTX4090/` 加进了忽略列表，正常情况下不会被提交。
+
+## 9. 常见问题
+
+### 9.1 看不到输出
+
+- 运行命令时加 `-u`
+- 尽量先 `conda activate`，再直接跑 `python`
+- 不要依赖缓冲输出判断程序是否还活着，建议配合 `tail -f`
+
+### 9.2 CUDA 不可用
+
+- 先看 `nvidia-smi`
+- 再确认当前环境里的 `torch` 是 CUDA 版
+- 若 `torch.cuda.is_available()` 为 `False`，先不要继续训练
+
+### 9.3 4090 显存不够
+
+- 先降 `--num-actors`
+- 再考虑减小 3D 路线的 `--population-size`
+- RL 路线下 `--max-epochs` 不影响单步显存，但会影响总时长
+
+### 9.4 STEP 没生成
+
+- 这是可选项，不影响核心训练
+- 先确认是否装了 FreeCAD CLI
+- 没有 FreeCAD 时，保留 STL 即可

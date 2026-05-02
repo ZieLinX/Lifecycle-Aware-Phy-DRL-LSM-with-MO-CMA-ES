@@ -27,6 +27,23 @@ class VecEnvTest(unittest.TestCase):
         self.assertIn("optimal_transient_time_s", info)
         self.assertIn("policy_dwell_time_s", info)
 
+    def test_lifetime_ratio_observation_is_capped(self) -> None:
+        cfg = CylinderPhysicsCfg()
+        cfg.device = "cpu"
+        cfg.num_rings = 12
+        cfg.thermal_max_iters = 8
+        cfg.voltage_grid_points = 3
+        cfg.voltage_refine_levels = 0
+        cfg.observation_lifetime_ratio_cap = 2.0
+        env = CylinderVecEnv(cfg, num_envs=1)
+        obs, _ = env.reset()
+        env.current_metrics["lifetime_s"] = env.baseline_metrics["lifetime_s"] * 100.0
+
+        obs = env._build_obs()
+
+        lifetime_ratio_obs = obs[0, env.num_rings * 3 + 4]
+        self.assertLessEqual(lifetime_ratio_obs, 2.0)
+
 
 if __name__ == "__main__":
     unittest.main()

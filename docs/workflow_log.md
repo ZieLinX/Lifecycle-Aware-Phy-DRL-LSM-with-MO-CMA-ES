@@ -276,9 +276,10 @@ python -m unittest tests.test_exporter_resolution tests.test_feasibility tests.t
 
 ## 8. 接手后新增：把“3D半成品”修复为最小可行真3D代理物理
 
-### 8.1 问题定位
+### 8.1 问题定位（历史；已修复）
 
-- 现有 `optimize_3d.py` / `utils/hybrid_optimizer_3d.py` 的几何变量是 `r(z,theta)`，但评估阶段会先用 `effective_ring_profile()` 折算回 1D profile，再调用 1D 额定工况搜索与瞬态，导致“3D 只停留在导出/可视化，物理仍是 2D”的偏差。
+- **曾存在的问题**：`optimize_3d.py` / `utils/hybrid_optimizer_3d.py` 的几何变量是 `r(z,theta)`，但评估阶段曾用 `effective_ring_profile()` 折算回 1D profile，再调用 1D 额定工况搜索与瞬态，导致“3D 只停留在导出/可视化，物理仍是 2D”的偏差。
+- **当前状态**：评估链已改为 `search_rated_condition_3d_batch()` + `simulate_transient_trajectory_3d()`，不再折算 1D；详见仓库提交 `71b632b` / `8a02926` 及单测 `tests/test_hybrid_optimizer_3d.py`。
 
 ### 8.2 修复目标（对齐题面与官方澄清）
 
@@ -308,3 +309,150 @@ python -m unittest tests.test_exporter_resolution tests.test_feasibility tests.t
 conda run -n mcga_xzh python -m unittest discover -s ./tests -p "test_hybrid_optimizer_3d.py"
 ```
 
+## 9. Agent 交接说明（RL 训练 vs 真 3D 优化、产物与已知现象）
+
+本节供后续 agent 快速对齐口径，**不要求重复踩坑**；与代码实现细节以仓库为准。
+
+### 9.1 两条几何/优化主线（务必区分）
+
+| 主线 | 入口 / 核心模块 | 几何表示 | 物理评估 |
+| --- | --- | --- | --- |
+| **Phy-DRL（当前 RL）** | `train_rl.py`、`envs/cylinder_vec_env.py` | **轴对称 ring profile**：`ring_radius` 形状 `(num_envs, num_rings)`，即仅随轴向 `z` 变化的一维剖面 | `search_rated_condition_batch()`、`simulate_transient_trajectory()` 等 **1D/轴对称** 路径 |
+| **真 3D 表面优化（混合 CEM）** | `optimize_3d.py`、`utils/hybrid_optimizer_3d.py` | **半径场** `r(z, theta)`，形状 `(num_rings, num_segments)` | `search_rated_condition_3d_batch()`、`simulate_transient_trajectory_3d()` |
+
+**结论**：在 `CylinderVecEnv` 上跑的 RL **不是** “完整三维表面 \(r(z,\theta)\) 自由度”的训练；若题目或交付要求明确要 **3D 非轴对称** 优化，应走 `optimize_3d.py` 路线（或未来将 VecEnv 升级为 `r(z,θ)` 并统一 3D rated-condition，属较大改造）。
+
+### 9.2 为什么 `topology_evolution.gif` 看起来像「平面图」
+
+- 动画由 `utils/animation.py` 的 `export_topology_evolution_animation()` 生成：使用 matplotlib 绘制 **轴向位置 `z` vs 半径 `r(z)`** 的子午剖面（`fill_between` + 上下对称 `±r`），**不是** 3D mesh 旋转体渲染。
+- 因此即使用 GPU 训练、即使物理在 GPU 上算，**GIF 仍是 2D 剖面可视化**，不代表「训练在 3D mesh 空间里画三角面」。
+
+### 9.3 为什么剖面「几乎不变」仍可能正常
+
+- `CylinderVecEnv._apply_action()` 中半径更新带 **`max_depth * 0.35`** 等小步缩放，且端面环固定、再经 `project_connected_profile_batch` 约束，**可视化尺度上可能极不明显**。
+- 判断是否真在动：看 `rollout_metrics.csv` / `run_summary.json` 中的 `feature_change_ratio`、`volume_change_ratio`、功率与寿命字段，而非仅凭 GIF 肉眼。
+
+### 9.4 控制台 `life` 与「两个簇」（~1000 vs ~1）
+
+- 训练日志里打印的 `life` 一般为 **相对基准寿命的比值**（`lifetime_s / baseline_lifetime_s`），**不是「年」**。
+- 代理物理下某些电压/几何组合蒸发极弱会导致 **寿命极大**，比值出现数百上千与接近 1 的样本并存，叠加策略探索，易形成 **双峰/两簇**；需结合 `feasible`、`P0-3`、`V*` 一起看，避免误读为「两个物理世界」。
+
+### 9.5 `info/kl` 长期高于 `kl_threshold`（`config/rl_games_ppo.yaml` 中为 `0.01`）
+
+- `kl_threshold` 存在于 rl_games 配置中；**日志中的 KL 为监控量**，是否等价于「每步已严格把更新压到阈值内」取决于 rl_games 版本与内部实现。
+- 本环境奖励来自重物理评估，**非平稳、尺度大** 时早期 KL 偏高较常见；是否构成问题应结合 **学习率是否自适应下降、回报曲线、是否发散** 判断，不能仅凭 KL 数值单独定性。
+
+### 9.6 GIF 上 `V* = 0.00V` 与 log 不一致（已修复）
+
+- `utils/animation.py` 中 `_render_frame()` 叠加文字使用键名 **`rated_voltage_v`**；而 rollout / metrics 字典中额定电压字段为 **`voltage_v`**。
+- 键名不匹配时 `get` 默认得到 `0.0`，故 GIF 上显示 **`0.00V`**，**不代表** 物理上电压为 0；以 log 与 `rollout_metrics.csv` 中 `voltage_v` 为准。
+- 本轮已改 `utils/animation.py`：动画读取指标时优先使用 `voltage_v`，并兼容旧键 `rated_voltage_v`；`P0-3`、`life`、`feasible` 也做了多键 fallback，以兼容 RL 与 3D 优化产物。
+
+### 9.7 RTX4090 云端训练与实时输出（参考）
+
+- 推荐使用仓库内 `docs/cloud_train_rtx4090_zh.md`（SSH、conda、tmux、产物路径）。
+- 训练脚本 `train_rl.py` 支持 `--console-interval`（每 N RL step 打印 `V*`/`P0-3`/寿命比/feasible）、`--realtime-interval`（形状快照）、可选 `--torch-compile`（启用 rl_games 侧 `torch_compile`，具体效果依环境而定）。
+- **日志缓冲**：云端建议 `python -u train_rl.py`；若 `conda run` 输出异常，可直接使用 conda 环境内 `python.exe` 路径执行（详见 `docs/cloud_train_rtx4090_zh.md`）。
+
+### 9.8 性能瓶颈备忘（给后续优化 agent）
+
+- 单核 CPU 高占用 + GPU 低占用时，常见瓶颈是 **大量小 kernel 发射**（如热迭代 `for` 内多算子）与 **Python 侧循环**，而非「显卡不够强」。
+- 已在 `utils/rated_condition.py` 等对 **feasibility / thermomech** 做批量向量化以降低 per-env Python 循环开销；若仍瓶颈，需 profiling 后再决策（例如是否对热迭代体做进一步融合，属改动面较大的工作）。
+
+### 9.9 文档与仓库状态
+
+- 工作流与实验记录以 **`docs/workflow_log.md`**（本文件）与 **`docs/research_solution_zh.md`** 为主。
+- 题目附件与 Q&A：`docs/研究背景与要求.png`、`docs/opencode.txt.xlsx`（勿提交临时导出的 `docs/_xlsx_export/`，已在 `.gitignore` 忽略）。
+
+## 10. 本轮接手：复盘 RTX4090 训练异常并修正 RL 评估/可视化
+
+### 10.1 输入与本地 git 状态
+
+- 用户提供 RTX4090 训练产物目录：`RTX4090/`。
+- 本轮接手时分支为 `xzh`；工作区已有未提交文档变更：
+  - `docs/workflow_log.md`
+  - `docs/research_solution_zh.md`
+- `RTX4090/` 为用户放入的未跟踪训练日志/产物目录，本轮只读取分析，不纳入提交。
+
+### 10.2 对五个严重问题的结论
+
+1. **为什么生成的 GIF 是平面图？是否真 3D？**
+   - RTX4090 运行的是 `train_rl.py` / `CylinderVecEnv`，几何自由度是轴对称 `ring_radius(z)`，不是完整 `r(z,theta)` 三维表面。
+   - `topology_evolution.gif` 本来就是 z-r 子午剖面可视化，不是 3D mesh 渲染。
+   - 若要真 3D 非轴对称优化，应运行 `optimize_3d.py` 路线。
+2. **为什么圆柱面没有发生过变化？**
+   - RTX4090 最终评估实际只执行了 2 步；`run_summary.json` 中 `feature_change_ratio=0.025808`，说明几何有变化但只有约 2.58% 特征尺度变化。
+   - 最终 `lifetime_ratio=0.267119`，低于 `minimum_lifetime_ratio=0.30`，因此评估提前终止；肉眼看 GIF 会显得变化很小。
+3. **为什么 `info/kl` 始终高于阈值？**
+   - TensorBoard event 中 `info/kl` 最小约 `0.00886`、最大约 `0.47123`、最后约 `0.01702`，确实经常高于 `kl_threshold=0.01`。
+   - 同一 event 中 `info/last_lr` 最终降到 `1e-6`，说明 rl_games 的 adaptive LR 已在响应 KL 偏高；问题不只是“阈值没生效”，还包括奖励尺度和极端寿命样本导致策略更新不稳定。
+4. **为什么模型像有两个方向（life ~1000 与 life ~1）？**
+   - 日志显示大量 `V*=2.51` 或接近 `0.01V` 的低功率样本有 `life` 数百到近千；同时 `V*=5.75~6.63V` 的样本功率更高但 `life` 常接近 1 或低于 1。
+   - 原奖励直接线性使用未截断的 `lifetime_ratio`，容易让低功率超长寿命样本与高功率短寿命样本形成两簇。
+5. **为什么 GIF 中 `V*` 始终为 `0.00V`，但 log 正常？**
+   - 确认为显示层键名 bug：最终评估 `metrics_history` 用 `voltage_v`，动画只读 `rated_voltage_v`。
+   - 本轮已修复为优先读 `voltage_v`，兼容 `rated_voltage_v`。
+
+### 10.3 本轮代码修正
+
+- `utils/animation.py`
+  - 新增 `_metric_float()` / `_metric_value()`，统一动画指标 fallback。
+  - `V*` 优先读 `voltage_v`，不再在最终 GIF 中错误显示 `0.00V`。
+  - 标题改为 `Axisymmetric Ring-Profile Evolution`，避免把 RL GIF 误解为真 3D。
+- `config/cylinder_cfg.py`
+  - 新增 `reward_lifetime_ratio_cap=5.0` 与 `observation_lifetime_ratio_cap=5.0`。
+- `envs/cylinder_vec_env.py`
+  - 奖励中的 `lifetime_ratio` 改为只在奖励项内截断，不改原始物理指标。
+  - 观测中的寿命比也做截断，降低超长寿命低功率样本对策略的支配。
+- `train_rl.py`
+  - 最终评估的 baseline/final 动画指标补 `lifetime_ratio` 与 `geometry_mode`。
+  - `run_summary.json` 新增 `geometry_mode`、`physics_mode`、`minimum_lifetime_ratio`、`rated_feasible`、`constraint_feasible`、`termination_reasons`、`max_radius_delta_mm`、`mean_abs_radius_delta_mm`。
+  - `feasible` 改为完整约束可行性，避免仅额定工况 `feasible=true` 掩盖 `lifetime_ratio < minimum_lifetime_ratio`。
+
+### 10.4 验证
+
+本轮已通过：
+
+```bash
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_animation tests.test_vec_env tests.test_static_compile
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_animation tests.test_exporter_resolution tests.test_feasibility tests.test_hybrid_optimizer tests.test_hybrid_optimizer_3d tests.test_physics_regression tests.test_planner tests.test_static_compile tests.test_transient tests.test_vec_env
+```
+
+结果：第一次 5 项测试通过；第二次 19 项非长训练测试通过。
+
+## 11. 本轮追问：确认真 3D GIF/MP4 与更新 RTX4090 Ubuntu 执行文档
+
+### 11.1 用户问题
+
+- 用户追问：现在是否能够生成 3D 的 GIF 和 MP4。
+- 用户要求：让子 agent 在原文档基础上写一份 RTX4090 Ubuntu 服务器执行训练/优化的文档。
+
+### 11.2 结论
+
+- `train_rl.py` 路线仍是轴对称 `ring_radius(z)` RL；它生成的 `topology_evolution.gif/.mp4` 是 z-r 剖面，不是真 3D。
+- `optimize_3d.py` 路线是真 3D 半径场 `r(z, theta)` 优化；它调用 `export_3d_evolution_animation()`，输出：
+  - `topology_evolution_3d.gif`
+  - `topology_evolution_3d.mp4`（取决于 imageio/ffmpeg/libx264 是否可用）
+
+### 11.3 本地 smoke 验证
+
+已执行：
+
+```bash
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe optimize_3d.py --device cpu --smoke --no-step --output-dir outputs\test_three_d_runs --experiment-name smoke_3d_doccheck --generations 1 --population-size 4 --thermal-iters 16 --seed 7
+```
+
+结果目录：
+
+- `outputs/test_three_d_runs/smoke_3d_doccheck_05-02-17-55`
+
+已确认生成：
+
+- `optimized_cylinder_3d.stl`
+- `topology_evolution_3d.gif`
+- `topology_evolution_3d.mp4`
+- `run_summary_3d.json`
+- `optimization_history_3d.csv`
+- `design_strategy_report_3d.md`
+
+该 smoke 用 CPU 和极小参数，仅验证导出链，不代表优化质量。4090 Ubuntu 上应使用 `--device cuda:0` 和更高 `generations/population-size/thermal-iters`。

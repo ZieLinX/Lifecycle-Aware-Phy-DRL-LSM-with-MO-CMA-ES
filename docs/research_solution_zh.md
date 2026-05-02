@@ -237,3 +237,9 @@ conda run -n mcga_xzh python train_rl.py --smoke
 7. 体积偏差：`0`
 
 这一路线保留 RL 作为对照，但当前交付和继续研究建议优先使用混合物理优化，因为它更省算力、更稳定、可解释性更强，并且已经满足题目输出链：STL、STP、拓扑演化 GIF/MP4、指标 CSV/JSON 和策略报告。
+
+## 11. 后续 Agent 交接索引
+
+- **RL（`train_rl.py`）与真 3D 优化（`optimize_3d.py`）** 的几何自由度、评估 API 不同；**GIF 为 z–r 剖面**；**GIF 上 `V*` 与 log 不一致** 等已知现象与排查建议，已集中写在 **`docs/workflow_log.md` 第 9 节**。
+- **4090 云端训练步骤** 见 **`docs/cloud_train_rtx4090_zh.md`**。
+- **3D 额定/瞬态已接入混合 3D 优化**（不再折算 1D）的修复说明见 **`docs/workflow_log.md` 第 8 节**。

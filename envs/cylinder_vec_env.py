@@ -165,10 +165,14 @@ class CylinderVecEnv:
         initial_ratio = metrics["initial_net_band_power_w"] / torch.clamp(baseline["initial_net_band_power_w"], min=1.0e-9)
         average_ratio = metrics["average_net_band_power_w"] / torch.clamp(baseline["average_net_band_power_w"], min=1.0e-9)
         lifetime_ratio = metrics["lifetime_s"] / torch.clamp(baseline["lifetime_s"], min=1.0e-9)
+        reward_lifetime_ratio = torch.clamp(
+            lifetime_ratio,
+            max=float(getattr(self.cfg, "reward_lifetime_ratio_cap", 5.0)),
+        )
         score = (
             float(self.cfg.reward_weight_initial_power) * initial_ratio
             + float(self.cfg.reward_weight_average_power) * average_ratio
-            + float(self.cfg.reward_weight_lifetime) * lifetime_ratio
+            + float(self.cfg.reward_weight_lifetime) * reward_lifetime_ratio
             + float(self.cfg.reward_weight_uniformity) * metrics["temperature_uniformity"]
             + float(self.cfg.reward_weight_efficiency) * metrics["band_efficiency"]
             + float(self.cfg.reward_weight_transient_power) * transient["transient_power_ratio"]
@@ -187,13 +191,18 @@ class CylinderVecEnv:
         radial_disp = (self.ring_radius - float(self.cfg.radius)) / max(float(self.cfg.radius), 1.0e-12)
         temp_norm = (self.temperature - float(self.cfg.ambient_temp)) / max(float(self.cfg.max_temp - self.cfg.ambient_temp), 1.0)
         ablation_norm = self.recession_depth / max(float(self.cfg.feature_fail_ratio * self.cfg.radius), 1.0e-12)
+        lifetime_ratio_obs = metrics["lifetime_s"] / torch.clamp(baseline["lifetime_s"], min=1.0e-9)
+        lifetime_ratio_obs = torch.clamp(
+            lifetime_ratio_obs,
+            max=float(getattr(self.cfg, "observation_lifetime_ratio_cap", 5.0)),
+        )
         global_obs = torch.stack(
             [
                 metrics["voltage_v"] / max(float(self.cfg.max_voltage), 1.0),
                 metrics["initial_net_band_power_w"] / torch.clamp(baseline["initial_net_band_power_w"], min=1.0e-9),
                 metrics["average_net_band_power_w"] / torch.clamp(baseline["average_net_band_power_w"], min=1.0e-9),
                 metrics["max_temperature_k"] / max(float(self.cfg.max_temp), 1.0),
-                metrics["lifetime_s"] / torch.clamp(baseline["lifetime_s"], min=1.0e-9),
+                lifetime_ratio_obs,
                 metrics["view_factor_proxy"],
                 metrics["feature_change_ratio"],
                 metrics["volume_change_ratio"],
