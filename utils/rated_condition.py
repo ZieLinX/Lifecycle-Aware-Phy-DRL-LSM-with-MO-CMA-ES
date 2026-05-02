@@ -213,6 +213,38 @@ def _laplacian_3d_axial(values: torch.Tensor) -> torch.Tensor:
     return lap
 
 
+def _radius_field_surface_area_terms(
+    cfg,
+    radius_field: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return lateral patch area plus slope/roughness terms for r(z, theta)."""
+    radius_field_b, _ = _to_batch_radius_field(radius_field)
+    r = torch.clamp(radius_field_b.float(), min=float(cfg.min_radius))
+    r[:, 0, :] = float(cfg.radius)
+    r[:, -1, :] = float(cfg.radius)
+    batch_size, num_rings, num_segments = r.shape
+    dz = float(cfg.height) / max(num_rings - 1, 1)
+    dtheta = 2.0 * math.pi / max(int(num_segments), 1)
+    axial_weight = _axial_weights(num_rings, dz, device=r.device).view(1, num_rings, 1)
+    if num_rings > 1:
+        dr_dz = torch.gradient(r, spacing=float(dz), dim=1)[0]
+    else:
+        dr_dz = torch.zeros_like(r)
+    if num_segments > 1:
+        dr_dtheta = (torch.roll(r, shifts=-1, dims=2) - torch.roll(r, shifts=1, dims=2)) / max(2.0 * float(dtheta), 1.0e-12)
+    else:
+        dr_dtheta = torch.zeros_like(r)
+    patch_area = torch.sqrt(r.pow(2) * (1.0 + dr_dz.pow(2)) + dr_dtheta.pow(2)) * axial_weight * float(dtheta)
+    roughness = torch.std(r, dim=(1, 2)) / torch.clamp(torch.mean(r, dim=(1, 2)), min=1.0e-12)
+    circum_nonuniformity = torch.mean(torch.std(r, dim=2), dim=1) / torch.clamp(torch.mean(r, dim=(1, 2)), min=1.0e-12)
+    slope_z = dr_dz / max(float(cfg.radius), 1.0e-12)
+    slope_theta = dr_dtheta / torch.clamp(r, min=1.0e-12)
+    area_ratio = torch.sum(patch_area, dim=(1, 2)) / max(2.0 * math.pi * float(cfg.radius) * float(cfg.height), 1.0e-12)
+    if batch_size == 0:
+        area_ratio = torch.empty((0,), dtype=torch.float32, device=r.device)
+    return patch_area, slope_z, slope_theta, roughness, circum_nonuniformity, area_ratio
+
+
 def _expand_initial_temperature_3d(initial_temperature, batch_size: int, num_rings: int, num_segments: int, device: torch.device) -> torch.Tensor | None:
     if initial_temperature is None:
         return None
@@ -282,17 +314,7 @@ def _evaluate_voltage_3d_batch(
     volume_change_ratio = torch.abs(volume - initial_volume_batch) / torch.clamp(initial_volume_batch, min=1.0e-12)
     feature_change_ratio = _feature_change_ratio_3d(cfg, r)
 
-    roughness = torch.std(r, dim=(1, 2)) / torch.clamp(torch.mean(r, dim=(1, 2)), min=1.0e-12)
-    circum_nonuniformity = torch.mean(torch.std(r, dim=2), dim=1) / torch.clamp(torch.mean(r, dim=(1, 2)), min=1.0e-12)
-
-    if num_rings > 1:
-        grad_z = torch.gradient(r, spacing=float(dz), dim=1)[0] / max(float(cfg.radius), 1.0e-12)
-    else:
-        grad_z = torch.zeros_like(r)
-    if num_segments > 1:
-        grad_theta = (torch.roll(r, shifts=-1, dims=2) - torch.roll(r, shifts=1, dims=2)) / max(2.0 * float(dtheta) * max(float(cfg.radius), 1.0e-12), 1.0e-12)
-    else:
-        grad_theta = torch.zeros_like(r)
+    lateral_surface, grad_z, grad_theta, roughness, circum_nonuniformity, surface_area_ratio = _radius_field_surface_area_terms(cfg, r)
 
     global_shadow = torch.clamp(
         1.0 - float(cfg.shadow_roughness_coeff) * roughness - 0.35 * circum_nonuniformity,
@@ -319,7 +341,6 @@ def _evaluate_voltage_3d_batch(
     thermal_iterations = torch.zeros(batch_size, dtype=torch.int64, device=device)
     thermal_converged = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-    lateral_surface = r * axial_weight * float(dtheta)
     thermal_mass = float(cfg.density) * area_wedge * axial_weight
 
     for iter_idx in range(int(cfg.thermal_max_iters)):
@@ -472,6 +493,7 @@ def _evaluate_voltage_3d_batch(
         "min_equivalent_diameter_mm": 2.0 * torch.amin(r, dim=(1, 2)) * 1.0e3,
         "feature_change_ratio_3d": feature_change_ratio,
         "volume_change_ratio_3d": volume_change_ratio,
+        "surface_area_ratio_3d": surface_area_ratio,
         "smoothness_penalty": roughness,
         "feasibility_penalty": feasibility_penalty,
         "thermo_mech_penalty": thermo_mech_penalty,
@@ -612,7 +634,7 @@ def simulate_transient_trajectory_3d(
     r[:, -1, :] = float(cfg.radius)
 
     area_wedge = math.pi * r.pow(2) / max(float(num_segments), 1.0)
-    lateral_surface = r * axial_weight * float(dtheta)
+    lateral_surface, grad_z, grad_theta, roughness, circum_nonuniformity, _surface_area_ratio = _radius_field_surface_area_terms(cfg, r)
     thermal_mass = float(cfg.density) * area_wedge * axial_weight
 
     if initial_temperature is None:
@@ -622,16 +644,6 @@ def simulate_transient_trajectory_3d(
         temperature = torch.clamp(temperature, min=float(cfg.ambient_temp))
     temperature = _apply_thermal_boundary_mode(cfg, temperature)
 
-    if num_rings > 1:
-        grad_z = torch.gradient(r, spacing=float(dz), dim=1)[0] / max(float(cfg.radius), 1.0e-12)
-    else:
-        grad_z = torch.zeros_like(r)
-    if num_segments > 1:
-        grad_theta = (torch.roll(r, shifts=-1, dims=2) - torch.roll(r, shifts=1, dims=2)) / max(2.0 * float(dtheta) * max(float(cfg.radius), 1.0e-12), 1.0e-12)
-    else:
-        grad_theta = torch.zeros_like(r)
-    roughness = torch.std(r, dim=(1, 2)) / torch.clamp(torch.mean(r, dim=(1, 2)), min=1.0e-12)
-    circum_nonuniformity = torch.mean(torch.std(r, dim=2), dim=1) / torch.clamp(torch.mean(r, dim=(1, 2)), min=1.0e-12)
     global_shadow = torch.clamp(
         1.0 - float(cfg.shadow_roughness_coeff) * roughness - 0.35 * circum_nonuniformity,
         min=float(cfg.min_view_factor),

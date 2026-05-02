@@ -8,6 +8,7 @@ import torch
 
 from config.cylinder_cfg import CylinderPhysicsCfg
 from utils.hybrid_optimizer_3d import build_3d_basis, fields_from_coefficients, radius_field_volume, run_hybrid_3d_optimization
+from utils.rated_condition import _evaluate_voltage_3d_batch
 from utils.rated_condition import search_rated_condition_3d_batch
 
 
@@ -52,6 +53,20 @@ class Hybrid3DOptimizerTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(metrics["initial_net_band_power_w"]).all().item())
         # squeezed input returns scalar tensors (matching existing 2D APIs).
         self.assertEqual(tuple(metrics["feasible"].shape), ())
+
+    def test_3d_physics_counts_slope_surface_area(self) -> None:
+        cfg = self._small_cfg()
+        cfg.shadow_slope_coeff = 0.0
+        cfg.shadow_roughness_coeff = 0.0
+        z = torch.linspace(-1.0, 1.0, cfg.num_rings, dtype=torch.float32)
+        theta = torch.linspace(0.0, 2.0 * math.pi, cfg.num_segments + 1, dtype=torch.float32)[:-1]
+        ripple = 0.05 * torch.sin(math.pi * (z + 1.0)).unsqueeze(1) * torch.cos(2.0 * theta).unsqueeze(0)
+        field = torch.full((cfg.num_rings, cfg.num_segments), float(cfg.radius), dtype=torch.float32) * (1.0 + ripple)
+        field[0, :] = float(cfg.radius)
+        field[-1, :] = float(cfg.radius)
+        initial_volume = math.pi * cfg.radius * cfg.radius * cfg.height
+        metrics = _evaluate_voltage_3d_batch(cfg, field, initial_volume, voltage_v=1.0)
+        self.assertGreater(metrics["surface_area_ratio_3d"].item(), 1.0)
 
     def test_hybrid_3d_smoke_returns_finite_best(self) -> None:
         cfg = self._small_cfg()

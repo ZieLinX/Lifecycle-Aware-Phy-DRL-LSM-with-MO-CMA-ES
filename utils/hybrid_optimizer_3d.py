@@ -129,7 +129,8 @@ def fields_from_coefficients(cfg, coefficients: np.ndarray, basis: np.ndarray) -
     if coeff.ndim == 1:
         coeff = coeff.reshape(1, -1)
     log_delta = np.einsum("bk,krs->brs", coeff, np.asarray(basis, dtype=np.float64))
-    log_delta = np.clip(log_delta, -0.10, 0.10)
+    max_log_delta = float(getattr(cfg, "hybrid3d_max_log_delta", 0.16))
+    log_delta = np.clip(log_delta, -max_log_delta, max_log_delta)
     raw = float(cfg.radius) * np.exp(log_delta)
     device = torch.device(cfg.device if torch.cuda.is_available() and str(cfg.device).startswith("cuda") else "cpu")
     return _project_radius_field(cfg, torch.as_tensor(raw, dtype=torch.float32, device=device))
@@ -174,7 +175,10 @@ def _surface_terms(cfg, radius_field: torch.Tensor) -> Dict[str, torch.Tensor]:
     area_ratio = area / max(cylinder_area, 1.0e-12)
     roughness = torch.std(r, dim=(1, 2)) / torch.clamp(torch.mean(r, dim=(1, 2)), min=1.0e-12)
     circum_nonuniformity = torch.mean(torch.std(r, dim=2), dim=1) / torch.clamp(torch.mean(r, dim=(1, 2)), min=1.0e-12)
-    view_factor = torch.exp(-0.20 * roughness - 0.35 * circum_nonuniformity)
+    view_factor = torch.exp(
+        -float(getattr(cfg, "shadow_roughness_coeff", 0.12)) * roughness
+        - 0.35 * circum_nonuniformity
+    )
     surface_gain = torch.clamp(area_ratio * view_factor, min=0.35, max=1.50)
     return {
         "surface_area_ratio": area_ratio,
@@ -215,10 +219,10 @@ def evaluate_radius_fields(cfg, radius_fields: torch.Tensor, baseline: Dict[str,
         baseline_power_w=torch.clamp(baseline["initial_net_band_power_w"], min=1.0e-9),
     )
     surface = _surface_terms(cfg, radius_fields)
-    adjusted_initial = metrics["initial_net_band_power_w"] * surface["surface_gain"]
-    adjusted_average = metrics["average_net_band_power_w"] * surface["surface_gain"]
-    adjusted_transient = transient_summary["transient_power_w"] * surface["surface_gain"]
-    adjusted_lifetime = metrics["lifetime_s"] / torch.clamp(surface["surface_area_ratio"], min=1.0)
+    adjusted_initial = metrics["initial_net_band_power_w"]
+    adjusted_average = metrics["average_net_band_power_w"]
+    adjusted_transient = transient_summary["transient_power_w"]
+    adjusted_lifetime = metrics["lifetime_s"]
     baseline_initial = torch.clamp(baseline["initial_net_band_power_w"], min=1.0e-9)
     baseline_average = torch.clamp(baseline["average_net_band_power_w"], min=1.0e-9)
     baseline_life = torch.clamp(baseline["lifetime_s"], min=1.0e-9)
@@ -248,7 +252,8 @@ def evaluate_radius_fields(cfg, radius_fields: torch.Tensor, baseline: Dict[str,
         - 70.0 * torch.clamp(float(cfg.minimum_lifetime_ratio) - lifetime_ratio, min=0.0)
         - 80.0 * torch.clamp(feature_change - float(cfg.feature_fail_ratio), min=0.0)
         - 60.0 * volume_change
-        - 3.0 * surface["circum_nonuniformity"]
+        + 0.08 * torch.clamp(surface["surface_area_ratio"] - 1.0, min=0.0, max=0.25)
+        - float(getattr(cfg, "hybrid3d_circum_penalty", 0.35)) * surface["circum_nonuniformity"]
     )
     score = torch.where(valid, score, score - 25.0)
     metrics = dict(metrics)
@@ -279,20 +284,47 @@ def _extract_metrics(metrics: Dict[str, torch.Tensor], transient: Dict[str, torc
 
 
 def _seed_coefficients(num_coeffs: int, axial_modes: int, circum_modes: int) -> list[np.ndarray]:
-    seeds = [np.zeros((num_coeffs,), dtype=np.float64)]
+    seeds = []
     if num_coeffs:
-        for amp in (-0.01, -0.015, 0.01):
+        for amp in (-0.025, 0.025, -0.055, 0.055, -0.090, 0.090):
             seed = np.zeros((num_coeffs,), dtype=np.float64)
             seed[0] = amp
             seeds.append(seed)
+    circum_count = 1 + 2 * int(circum_modes)
+    if axial_modes >= 3 and circum_count * 2 < num_coeffs:
+        for amp in (-0.045, 0.045, -0.080, 0.080):
+            seed = np.zeros((num_coeffs,), dtype=np.float64)
+            seed[circum_count * 2] = amp
+            seeds.append(seed)
+    if axial_modes >= 3 and circum_count * 2 < num_coeffs:
+        for amp0, amp2 in ((-0.040, 0.075), (0.040, -0.075)):
+            seed = np.zeros((num_coeffs,), dtype=np.float64)
+            seed[0] = amp0
+            seed[circum_count * 2] = amp2
+            seeds.append(seed)
     if circum_modes >= 1 and axial_modes >= 1:
-        for idx in (1, 2):
+        for idx in range(1, min(1 + 2 * int(circum_modes), num_coeffs)):
             if idx < num_coeffs:
-                for amp in (-0.012, 0.012):
+                for amp in (-0.035, 0.035, -0.070, 0.070):
                     seed = np.zeros((num_coeffs,), dtype=np.float64)
                     seed[idx] = amp
                     seeds.append(seed)
     return seeds
+
+
+def _merge_population(samples: np.ndarray, seeds: list[np.ndarray], population_size: int) -> np.ndarray:
+    rows: list[np.ndarray] = []
+    seen: set[tuple[float, ...]] = set()
+    for row in [*seeds, *list(np.asarray(samples, dtype=np.float64))]:
+        arr = np.asarray(row, dtype=np.float64)
+        key = tuple(np.round(arr, 10).tolist())
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(arr)
+        if len(rows) >= int(population_size):
+            break
+    return np.stack(rows, axis=0)
 
 
 def run_hybrid_3d_optimization(
@@ -319,14 +351,16 @@ def run_hybrid_3d_optimization(
     best_score = float(baseline_score_t[0].item())
     best_coeff = np.zeros((num_coeffs,), dtype=np.float64)
     mean = np.zeros_like(best_coeff)
-    sigma = np.full_like(mean, 0.035)
+    sigma = np.full_like(mean, float(getattr(cfg, "hybrid3d_initial_sigma", 0.075)))
+    sigma_min = float(getattr(cfg, "hybrid3d_min_sigma", 0.010))
+    sigma_max = float(getattr(cfg, "hybrid3d_max_sigma", 0.140))
     seeds = _seed_coefficients(num_coeffs, axial_modes, circum_modes)
     elite_count = max(2, int(round(float(population_size) * float(elite_fraction))))
     candidate_count = 1
 
     for generation in range(1, int(generations) + 1):
         samples = rng.normal(mean, sigma, size=(max(int(population_size), len(seeds)), num_coeffs))
-        population = np.vstack(seeds + [row for row in samples])[: int(population_size)] if generation == 1 else samples[: int(population_size)]
+        population = _merge_population(samples, seeds, int(population_size)) if generation == 1 else samples[: int(population_size)]
         fields = fields_from_coefficients(cfg, population, basis)
         metrics, transient, scores = evaluate_radius_fields(cfg, fields, baseline_metrics_t)
         candidate_count += int(population.shape[0])
@@ -339,7 +373,11 @@ def run_hybrid_3d_optimization(
         weights = np.exp((elite_scores - np.max(elite_scores)) / max(float(np.std(elite_scores)), 1.0e-6))
         weights = weights / np.sum(weights)
         mean = np.sum(elites * weights[:, None], axis=0)
-        sigma = np.clip(np.sqrt(np.sum(weights[:, None] * (elites - mean) ** 2, axis=0)) * 0.85 + sigma * 0.15, 0.004, 0.055)
+        sigma = np.clip(
+            np.sqrt(np.sum(weights[:, None] * (elites - mean) ** 2, axis=0)) * 0.85 + sigma * 0.15,
+            sigma_min,
+            sigma_max,
+        )
         idx = int(order[0])
         if float(scores[idx].item()) > best_score:
             best_score = float(scores[idx].item())
@@ -455,6 +493,7 @@ def write_3d_strategy_report(output_dir: str | Path, result: Hybrid3DResult, sum
         "",
         "- 本路线直接优化三维表面半径场 `r(z, theta)`，不是二维剖面旋转。",
         "- 设计变量采用轴向 Chebyshev 基和周向 Fourier 基，输出为非轴对称三维 mesh。",
+        "- 3D 热辐射/蒸发计算使用曲面面元 `sqrt(r^2(1+(dr/dz)^2)+(dr/dtheta)^2) dz dtheta`，不是平面展开面积。",
         "- `100V` 仍只作为上限；每个三维候选先搜索可行额定电压，再搜索瞬态窗口内最佳采样时间。",
         "",
         "## 细网格结果",
@@ -464,6 +503,14 @@ def write_3d_strategy_report(output_dir: str | Path, result: Hybrid3DResult, sum
         f"- 寿命比例：`{summary.get('lifetime_ratio_3d', 0.0):.4f}`",
         f"- 体积偏差：`{summary.get('volume_change_ratio_3d', 0.0):.6g}`",
         f"- 三维特征尺度变化：`{summary.get('feature_change_ratio_3d', 0.0):.6g}`",
+        f"- 选择原因：`{summary.get('selection_reason_3d', 'n/a')}`",
+        f"- archive 可行候选数：`{summary.get('archive_feasible_count', 0)}/{summary.get('archive_candidate_count', 0)}`",
+        "",
+        "## Archive 诊断",
+        "",
+        f"- 最佳非基准 score 候选：`{summary.get('best_nonbaseline_by_score')}`",
+        f"- 最佳可行非基准初始功率候选：`{summary.get('best_feasible_nonbaseline_by_initial_power')}`",
+        f"- 非基准最大表面积比：`{summary.get('max_nonbaseline_surface_area_ratio', 1.0)}`",
         "",
         "## 设计启发",
         "",

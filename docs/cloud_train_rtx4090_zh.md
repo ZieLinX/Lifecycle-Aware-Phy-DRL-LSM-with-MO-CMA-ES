@@ -300,3 +300,58 @@ scp <user>@<host>:~/work/make_cylinder_great_again/3d_4090.log RTX4090/
 - 先确认是否装了 FreeCAD CLI
 - 如果 FreeCAD 转换卡住，终止当前任务后拉取最新代码，使用 `--freecad-timeout 20` 检查；正式优化继续建议加 `--no-step`
 - 没有 FreeCAD 时，保留 STL 即可
+
+## 10. 3D 正式跑仍选回 baseline 怎么看
+
+拉取最新 `xzh` 后，3D 路线已修正两点：
+
+- 3D rated-condition 和 transient 现在使用真实曲面面元面积 `sqrt(r^2(1+(dr/dz)^2)+(dr/dtheta)^2) dz dtheta`，不再把非平直 3D 表面当作平面展开面积。
+- `run_summary_3d.json` 和 `design_strategy_report_3d.md` 会写出 archive 诊断，包括 `selection_reason_3d`、`best_nonbaseline_by_score`、`best_feasible_nonbaseline_by_initial_power`、`max_nonbaseline_surface_area_ratio`。
+
+建议先跑一个快速 3D 冒烟确认诊断字段存在：
+
+```bash
+python -u optimize_3d.py --smoke --no-step --experiment-name mcga_3d_diag_smoke
+```
+
+然后正式跑：
+
+```bash
+mkdir -p logs
+python -u optimize_3d.py \
+  --experiment-name mcga_3d_4090 \
+  --output-dir outputs/three_d_runs \
+  --generations 4 \
+  --population-size 16 \
+  --axial-modes 4 \
+  --circum-modes 2 \
+  --thermal-iters 640 \
+  --no-step \
+  2>&1 | tee -a logs/train_$(date +%F_%H%M%S).log
+```
+
+跑完重点看：
+
+```bash
+python - <<'PY'
+import json, pathlib
+root = sorted(pathlib.Path("outputs/three_d_runs").glob("mcga_3d_4090_*"))[-1]
+s = json.loads((root / "run_summary_3d.json").read_text())
+for k in [
+    "selected_archive_index",
+    "selection_reason_3d",
+    "initial_power_ratio_3d",
+    "lifetime_ratio_3d",
+    "feature_change_ratio_3d",
+    "max_nonbaseline_surface_area_ratio",
+    "best_feasible_nonbaseline_by_initial_power",
+]:
+    print(k, "=", s.get(k))
+PY
+```
+
+如果 `selected_archive_index=0`，现在不再只能说明“结果没变”，而要看 `selection_reason_3d`：
+
+- `no feasible non-baseline candidate improved...`：有 3D 形变，但细网格复评后功率没有超过圆柱。
+- `all feasible non-baseline candidates scored below baseline`：可能功率、寿命、温度均匀性或约束综合后输给 baseline。
+- `selected feasible archive candidate...`：已选中非基准 3D 候选。

@@ -650,3 +650,83 @@ python -u optimize_3d.py \
   --no-step \
   2>&1 | tee -a logs/train_$(date +%F_%H%M%S).log
 ```
+
+## 16. 3D 正式优化选回 baseline 的诊断与修复
+
+### 16.1 用户反馈
+
+用户在 RTX4090 Ubuntu 服务器执行正式 3D 路线：
+
+```bash
+python -u optimize_3d.py \
+  --experiment-name mcga_3d_4090 \
+  --output-dir outputs/three_d_runs \
+  --generations 4 \
+  --population-size 16 \
+  --axial-modes 4 \
+  --circum-modes 2 \
+  --thermal-iters 640 \
+  --no-step \
+  2>&1 | tee -a logs/train_$(date +%F_%H%M%S).log
+```
+
+服务器结果显示：
+
+- `selected_archive_index=0`
+- `initial_power_ratio_3d=1.0`
+- `lifetime_ratio_3d=1.0`
+- `feature_change_ratio_3d=0.0`
+- `surface_area_ratio=1.0`
+
+这说明 3D 优化链路和 GIF/STL 导出已经运行，但细网格复评最终选回了初始圆柱，正式跑没有产出非基准形变。
+
+### 16.2 本地排查结论
+
+- 首代种群中存在重复零候选，archive 会把与 baseline 完全相同的候选作为非基准记录，干扰诊断。
+- 旧 3D rated-condition/transient 的辐射和蒸发侧面积仍近似使用 `r * dz * dtheta`，没有把 `dr/dz` 和 `dr/dtheta` 带来的曲面面元面积纳入物理计算。
+- `run_summary_3d.json` 只写最终选择，没有写最佳非基准候选、可行数量、最大表面积变化等诊断，因此服务器上只能看到 `selected_archive_index=0`，看不到非基准候选输在哪里。
+
+### 16.3 修改内容
+
+- `utils/rated_condition.py`
+  - 新增 3D 曲面面元计算：`sqrt(r^2(1+(dr/dz)^2)+(dr/dtheta)^2) dz dtheta`。
+  - 3D rated-condition 和 transient 的辐射、蒸发功率现在使用真实曲面侧面积。
+  - 输出 `surface_area_ratio_3d` 作为底层物理诊断。
+- `utils/hybrid_optimizer_3d.py`
+  - `evaluate_radius_fields()` 不再对功率二次乘 `surface_gain`，避免真实面积进入物理后重复补偿。
+  - 放开默认 CEM 搜索幅度：`hybrid3d_initial_sigma=0.075`、`hybrid3d_max_sigma=0.140`、`hybrid3d_max_log_delta=0.160`。
+  - 增强 3D 种子，加入更明显的轴向和周向模式。
+  - 首代种群去重，不再重复塞零候选。
+  - 3D 报告写入选择原因和 archive 诊断。
+- `optimize_3d.py`
+  - 新增 CLI 参数：`--initial-sigma`、`--min-sigma`、`--max-sigma`、`--max-log-delta`、`--circum-penalty`。
+  - `run_summary_3d.json` 新增：
+    - `selection_reason_3d`
+    - `archive_candidate_count`
+    - `archive_feasible_count`
+    - `archive_feasible_nonbaseline_count`
+    - `best_nonbaseline_by_score`
+    - `best_feasible_nonbaseline_by_initial_power`
+    - `max_nonbaseline_surface_area_ratio`
+- `tests/test_hybrid_optimizer_3d.py`
+  - 新增回归测试，确认有斜率的 3D 半径场会得到 `surface_area_ratio_3d > 1.0`。
+- `docs/cloud_train_rtx4090_zh.md`
+  - 追加服务器复跑和诊断字段查看方法。
+
+### 16.4 验证
+
+已通过：
+
+```bash
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_static_compile
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_hybrid_optimizer_3d
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_hybrid_optimizer_3d tests.test_physics_regression tests.test_static_compile
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe optimize_3d.py --device cpu --smoke --no-step --experiment-name local_diag_smoke
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_animation tests.test_exporter_resolution tests.test_feasibility tests.test_hybrid_optimizer tests.test_hybrid_optimizer_3d tests.test_physics_regression tests.test_planner tests.test_static_compile tests.test_transient tests.test_vec_env
+```
+
+结果：
+
+- 3D/physics/static 组合测试 10 项通过。
+- 本地 CPU 3D smoke 正常生成 STL/GIF/MP4，并在 `run_summary_3d.json` 输出 `selection_reason_3d`、`best_feasible_nonbaseline_by_initial_power`、`max_nonbaseline_surface_area_ratio` 等诊断字段。
+- 非长训练全量单元测试 22 项通过。

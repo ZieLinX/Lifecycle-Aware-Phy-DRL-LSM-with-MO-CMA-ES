@@ -193,6 +193,15 @@ class CylinderPhysicsCfg:
     planner_weight_temp = 0.45
     planner_weight_ablation = 0.35
 
+    # True-3D optimizer controls. These are intentionally separate from the
+    # axisymmetric hybrid/RL search knobs because r(z, theta) has different
+    # smoothness and surface-area behavior.
+    hybrid3d_initial_sigma = 0.075
+    hybrid3d_min_sigma = 0.010
+    hybrid3d_max_sigma = 0.140
+    hybrid3d_max_log_delta = 0.160
+    hybrid3d_circum_penalty = 0.35
+
     # Export settings
     freecad_cmd = ""
     freecad_timeout_s = 90.0
