@@ -858,3 +858,53 @@ full3d smoke 结果：
 - full3d/sidefield/physics/static 组合测试 13 项通过。
 - 旧 `--backend sidefield` CPU smoke 兼容通过。
 - 非长训练全量单元测试 25 项通过。
+
+## 19. full3d 固定电压温度诊断修复
+
+### 19.1 用户反馈
+
+用户在 RTX4090 Ubuntu 服务器执行：
+
+```bash
+python -u optimize_3d.py \
+  --backend full3d \
+  --smoke \
+  --no-step \
+  --experiment-name full3d_v_sweep \
+  --fixed-voltage 20
+```
+
+输出仍显示 `max_temperature_k=4909.725`，与之前 100V smoke 完全相同；这说明 `--fixed-voltage` 虽然进入了配置，但 full3d 温度报告被硬裁剪掩盖了电压变化。
+
+### 19.2 修复内容
+
+- `utils/full3d_optimizer.py`
+  - 移除 full3d 温度 `clip(max_temp * 1.5)`，改为求解固定电压下的未裁剪热平衡温度。
+  - 电阻随温度按钨电阻率系数更新，热平衡包含全谱辐射冷却和蒸发潜热项。
+  - 0-3 微米到 0K 外接球的净辐射仍作为优化目标，新增 `blackbody_band_fraction_0_3um`、`electrical_power_w`、`full_spectrum_radiative_power_w`、`thermal_balance_residual_w` 等诊断。
+  - 候选选择改为优先选择满足体积、电极、温度、寿命约束的可行候选；若固定电压下全 archive 不可行，则明确写出 `selection_reason_full3d`。
+  - `Full3DResult` 增加 `archive_metrics` 和 `selection_diagnostics`，便于服务器端复盘。
+  - full3d MP4 帧尺寸改为 960x608，避免 imageio 因宏块尺寸自动 resize 的警告。
+- `optimize_3d.py`
+  - `run_summary_full3d.json` 新增 `fixed_voltage_v`、`baseline_feasible_full3d`、`archive_feasible_count`、`selected_archive_index`、`selection_reason_full3d`、`best_archive_by_score` 等字段。
+- `tests/test_full3d_optimizer.py`
+  - 新增回归测试确认 20V 和 100V 下 full3d 温度诊断不同，且温度随固定电压升高而上升。
+  - 保留顶/底面可动性测试，但不再要求最终选择一定选中变形候选，因为选择器现在优先物理可行性。
+
+### 19.3 本地验证
+
+已通过：
+
+```bash
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_full3d_optimizer tests.test_static_compile
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe optimize_3d.py --backend full3d --device cpu --smoke --no-step --experiment-name full3d_fixed_voltage_check --fixed-voltage 20
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_animation tests.test_exporter_resolution tests.test_feasibility tests.test_full3d_optimizer tests.test_hybrid_optimizer tests.test_hybrid_optimizer_3d tests.test_physics_regression tests.test_planner tests.test_static_compile tests.test_transient tests.test_vec_env
+```
+
+验证结果：
+
+- full3d/static 组合测试 6 项通过。
+- full3d CPU smoke 正常生成 STL/GIF/MP4/JSON/报告。
+- 完整非长训练测试集 27 项通过。
+- 本地探针显示固定电压已生效：5V、10V、20V、50V、100V 输出不同温度，20V 不再被报告为原来的裁剪值 `4909.725K`。
+- 在当前简化模型下 20V 仍超温，summary 会明确写 `archive_feasible_count=0` 和 `selection_reason_full3d=no full3d candidate satisfied fixed-voltage...`。

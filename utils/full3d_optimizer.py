@@ -19,7 +19,7 @@ import torch.nn.functional as F
 import trimesh
 
 from utils.exporter import _run_freecad_stl_to_step
-from utils.rated_condition import _band_fraction_tensor, _evaporation_flux_kg_m2_s, _material_properties
+from utils.rated_condition import blackbody_band_fraction, _evaporation_flux_kg_m2_s
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,8 @@ class Full3DResult:
     history_geometries: List[Full3DGeometry]
     history_metrics: List[Dict[str, float]]
     candidate_count: int
+    archive_metrics: List[Dict[str, float]]
+    selection_diagnostics: Dict[str, object]
 
 
 class Full3DUNetGNNPolicy(nn.Module):
@@ -289,17 +291,123 @@ def _apply_strategy_displacement(cfg, geometry: Full3DGeometry, strategy: torch.
     return _clone_geometry(geometry, vertices)
 
 
+def _polygon_area_xy(points: np.ndarray) -> float:
+    x = points[:, 0]
+    y = points[:, 1]
+    return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
+def _axial_resistance_shape_factor(geometry: Full3DGeometry, cfg) -> float:
+    side = geometry.vertices[geometry.side_indices]
+    ring_z = np.mean(side[:, :, 2], axis=1)
+    ring_area = np.asarray([_polygon_area_xy(points[:, :2]) for points in side], dtype=np.float64)
+    order = np.argsort(ring_z)
+    z = ring_z[order]
+    area = np.maximum(ring_area[order], 1.0e-12)
+    dz = np.diff(z)
+    valid = dz > 1.0e-10
+    if not np.any(valid):
+        return float(cfg.height) / max(math.pi * float(cfg.radius) ** 2, 1.0e-12)
+    inv_area = 0.5 * (1.0 / area[:-1] + 1.0 / area[1:])
+    shape_factor = float(np.sum(dz[valid] * inv_area[valid]))
+    baseline = float(cfg.height) / max(math.pi * float(cfg.radius) ** 2, 1.0e-12)
+    return max(shape_factor, 0.05 * baseline)
+
+
+def _band_fraction_for_balance(cfg, temperature: float) -> float:
+    quantized = round(max(float(temperature), 100.0) / 25.0) * 25.0
+    return float(blackbody_band_fraction(float(quantized), float(cfg.in_band_upper_um)))
+
+
+def _total_radiative_emissivity(cfg, temperature: float) -> float:
+    band_fraction = _band_fraction_for_balance(cfg, temperature)
+    return float(cfg.band_emissivity) * band_fraction + float(cfg.out_of_band_emissivity) * (1.0 - band_fraction)
+
+
+def _solve_full3d_thermal_state(
+    cfg,
+    voltage: float,
+    shape_factor: float,
+    effective_area: float,
+    surface_area: float,
+) -> Dict[str, float]:
+    sphere_temp = float(getattr(cfg, "full3d_sphere_temperature_k", 0.0))
+    min_temp = max(sphere_temp + 1.0, 1.0)
+    voltage = max(float(voltage), 0.0)
+    shape_factor = max(float(shape_factor), 1.0e-12)
+    effective_area = max(float(effective_area), 1.0e-12)
+    surface_area = max(float(surface_area), 1.0e-12)
+
+    def state_at(temp: float) -> tuple[float, float, float, float, float, float]:
+        delta = max(float(temp) - 300.0, 0.0)
+        rho_elec = float(cfg.rho_elec_ref) * (1.0 + float(cfg.rho_elec_temp_coeff) * delta)
+        resistance = max(rho_elec * shape_factor + float(cfg.external_series_resistance), float(cfg.min_resistance))
+        current = min(voltage / resistance, float(cfg.max_current))
+        electrical_power = voltage * current
+        emissivity = _total_radiative_emissivity(cfg, temp)
+        full_radiative_power = (
+            emissivity
+            * float(cfg.stefan_boltzmann)
+            * effective_area
+            * max(float(temp) ** 4 - sphere_temp ** 4, 0.0)
+            * float(getattr(cfg, "full3d_sphere_emissivity", 1.0))
+        )
+        temp_t = torch.full((1,), float(temp), dtype=torch.float32)
+        evap_flux = float(_evaporation_flux_kg_m2_s(cfg, temp_t)[0].item())
+        evaporative_power = evap_flux * surface_area * float(cfg.latent_heat_evap)
+        residual = electrical_power - full_radiative_power - evaporative_power
+        return residual, resistance, current, electrical_power, full_radiative_power, evaporative_power
+
+    if voltage <= 0.0:
+        residual, resistance, current, electrical_power, full_radiative_power, evaporative_power = state_at(min_temp)
+        return {
+            "temperature_k": float(min_temp),
+            "resistance_ohm": float(resistance),
+            "current_a": float(current),
+            "electrical_power_w": float(electrical_power),
+            "full_spectrum_radiative_power_w": float(full_radiative_power),
+            "evaporative_power_w": float(evaporative_power),
+            "thermal_balance_residual_w": float(residual),
+        }
+
+    low = min_temp
+    high = max(float(cfg.max_temp), float(cfg.ambient_temp), sphere_temp + 1.0)
+    residual_high = state_at(high)[0]
+    for _ in range(32):
+        if residual_high <= 0.0:
+            break
+        high *= 1.5
+        residual_high = state_at(high)[0]
+    else:
+        high = max(high, 1.0e5)
+
+    for _ in range(72):
+        mid = 0.5 * (low + high)
+        residual_mid = state_at(mid)[0]
+        if residual_mid > 0.0:
+            low = mid
+        else:
+            high = mid
+    temperature = 0.5 * (low + high)
+    residual, resistance, current, electrical_power, full_radiative_power, evaporative_power = state_at(temperature)
+    return {
+        "temperature_k": float(temperature),
+        "resistance_ohm": float(resistance),
+        "current_a": float(current),
+        "electrical_power_w": float(electrical_power),
+        "full_spectrum_radiative_power_w": float(full_radiative_power),
+        "evaporative_power_w": float(evaporative_power),
+        "thermal_balance_residual_w": float(residual),
+    }
+
+
 def evaluate_full3d_geometry(cfg, geometry: Full3DGeometry, baseline_metrics: Dict[str, float] | None = None) -> Dict[str, float]:
     target_volume = math.pi * float(cfg.radius) ** 2 * float(cfg.height)
     volume = mesh_volume(geometry)
     volume_change = abs(volume - target_volume) / max(target_volume, 1.0e-18)
     area, normals, centers = _mesh_area_normals_centers(geometry)
-    device = torch.device(cfg.device if torch.cuda.is_available() and str(cfg.device).startswith("cuda") else "cpu")
     voltage = float(getattr(cfg, "full3d_fixed_voltage_v", 100.0))
-    avg_radius = math.sqrt(max(volume, 1.0e-18) / (math.pi * float(cfg.height)))
-    resistance = float(cfg.rho_elec_ref) * float(cfg.height) / max(math.pi * avg_radius * avg_radius, 1.0e-12)
-    current = voltage / max(resistance, float(cfg.min_resistance))
-    electrical_power = voltage * current
+    shape_factor = _axial_resistance_shape_factor(geometry, cfg)
     surface_area = float(np.sum(area))
     cylinder_area = 2.0 * math.pi * float(cfg.radius) * float(cfg.height) + 2.0 * math.pi * float(cfg.radius) ** 2
     center_to_face = centers - np.mean(geometry.vertices, axis=0)
@@ -310,10 +418,10 @@ def evaluate_full3d_geometry(cfg, geometry: Full3DGeometry, baseline_metrics: Di
         1.0,
     )
     effective_area = float(np.sum(area * escape))
-    temperature = (electrical_power / max(float(cfg.band_emissivity) * float(cfg.stefan_boltzmann) * effective_area, 1.0e-12)) ** 0.25
-    temperature = float(np.clip(temperature, float(cfg.ambient_temp), float(cfg.max_temp) * 1.5))
-    temp_t = torch.full((1,), temperature, dtype=torch.float32, device=device)
-    band_fraction = float(_band_fraction_tensor(cfg, temp_t, cfg.in_band_upper_um)[0].item())
+    thermal = _solve_full3d_thermal_state(cfg, voltage, shape_factor, effective_area, surface_area)
+    temperature = float(thermal["temperature_k"])
+    temp_t = torch.full((1,), temperature, dtype=torch.float32)
+    band_fraction = float(blackbody_band_fraction(temperature, float(cfg.in_band_upper_um)))
     sphere_temp = float(getattr(cfg, "full3d_sphere_temperature_k", 0.0))
     net_band_power = (
         float(cfg.band_emissivity)
@@ -355,15 +463,21 @@ def evaluate_full3d_geometry(cfg, geometry: Full3DGeometry, baseline_metrics: Di
     return {
         "score": float(score),
         "voltage_v": voltage,
-        "current_a": float(current),
-        "resistance_ohm": float(resistance),
+        "current_a": float(thermal["current_a"]),
+        "resistance_ohm": float(thermal["resistance_ohm"]),
+        "electrical_power_w": float(thermal["electrical_power_w"]),
+        "full_spectrum_radiative_power_w": float(thermal["full_spectrum_radiative_power_w"]),
+        "evaporative_power_w": float(thermal["evaporative_power_w"]),
+        "thermal_balance_residual_w": float(thermal["thermal_balance_residual_w"]),
         "mean_temperature_k": temperature,
         "max_temperature_k": temperature,
         "net_radiated_power_0k_sphere_w": float(net_band_power),
         "effective_radiating_area_m2": float(effective_area),
         "surface_area_m2": float(surface_area),
         "surface_area_ratio": float(surface_area / max(cylinder_area, 1.0e-12)),
+        "axial_resistance_shape_factor_m_inv": float(shape_factor),
         "escape_view_factor_proxy": float(effective_area / max(surface_area, 1.0e-12)),
+        "blackbody_band_fraction_0_3um": float(band_fraction),
         "lifetime_s": float(lifetime_s),
         "lifetime_ratio_3d": float(lifetime_ratio),
         "mass_loss_rate_kg_s": float(mass_loss_rate),
@@ -379,6 +493,80 @@ def evaluate_full3d_geometry(cfg, geometry: Full3DGeometry, baseline_metrics: Di
     }
 
 
+def _full3d_metric_rank(metrics: Dict[str, float]) -> tuple[int, float]:
+    return (1 if bool(metrics.get("constraint_feasible_3d", False)) else 0, float(metrics.get("score", -float("inf"))))
+
+
+def _select_full3d_candidate(candidates: list[tuple[Full3DGeometry, Dict[str, float]]]) -> tuple[Full3DGeometry, Dict[str, float]]:
+    return max(candidates, key=lambda item: _full3d_metric_rank(item[1]))
+
+
+def _full3d_metric_snapshot(metrics: Dict[str, float]) -> Dict[str, object]:
+    keys = [
+        "archive_index",
+        "score",
+        "constraint_feasible_3d",
+        "voltage_v",
+        "net_radiated_power_0k_sphere_w",
+        "lifetime_ratio_3d",
+        "max_temperature_k",
+        "temperature_violation_ratio",
+        "volume_change_ratio_3d",
+        "electrode_max_error_m",
+        "effective_radiating_area_m2",
+        "surface_area_ratio",
+        "escape_view_factor_proxy",
+    ]
+    return {key: metrics[key] for key in keys if key in metrics}
+
+
+def _full3d_selection_diagnostics(
+    archive_metrics: List[Dict[str, float]],
+    selected_metrics: Dict[str, float],
+    baseline_metrics: Dict[str, float],
+    cfg,
+) -> Dict[str, object]:
+    feasible = [item for item in archive_metrics if bool(item.get("constraint_feasible_3d", False))]
+    nonbaseline = [item for item in archive_metrics if int(item.get("archive_index", -1)) != 0]
+    feasible_nonbaseline = [item for item in nonbaseline if bool(item.get("constraint_feasible_3d", False))]
+    best_by_score = max(archive_metrics, key=lambda item: float(item.get("score", -float("inf"))))
+    best_feasible_by_power = (
+        max(feasible, key=lambda item: float(item.get("net_radiated_power_0k_sphere_w", -float("inf"))))
+        if feasible
+        else None
+    )
+    selected_idx = int(selected_metrics.get("archive_index", 0))
+    baseline_feasible = bool(baseline_metrics.get("constraint_feasible_3d", False))
+    if not feasible:
+        reason = (
+            "no full3d candidate satisfied fixed-voltage temperature, lifetime, volume, and electrode constraints; "
+            "selected the highest penalized diagnostic score"
+        )
+    elif selected_idx == 0:
+        reason = "baseline retained: no feasible non-baseline full3d candidate improved the feasible score"
+    else:
+        reason = "selected feasible full3d candidate with highest constrained score"
+
+    diagnostics: Dict[str, object] = {
+        "selected_archive_index": selected_idx,
+        "selection_reason_full3d": reason,
+        "fixed_voltage_v": float(getattr(cfg, "full3d_fixed_voltage_v", 100.0)),
+        "max_allowed_temperature_k": float(cfg.max_temp),
+        "baseline_feasible_full3d": baseline_feasible,
+        "archive_candidate_count": int(len(archive_metrics)),
+        "archive_feasible_count": int(len(feasible)),
+        "archive_feasible_nonbaseline_count": int(len(feasible_nonbaseline)),
+        "best_archive_by_score": _full3d_metric_snapshot(best_by_score),
+    }
+    if best_feasible_by_power is not None:
+        diagnostics["best_feasible_archive_by_0k_power"] = _full3d_metric_snapshot(best_feasible_by_power)
+    if nonbaseline:
+        diagnostics["max_nonbaseline_surface_area_ratio"] = float(max(item.get("surface_area_ratio", 0.0) for item in nonbaseline))
+        diagnostics["max_nonbaseline_effective_area_m2"] = float(max(item.get("effective_radiating_area_m2", 0.0) for item in nonbaseline))
+        diagnostics["min_nonbaseline_temperature_k"] = float(min(item.get("max_temperature_k", float("inf")) for item in nonbaseline))
+    return diagnostics
+
+
 def run_full3d_optimization(
     cfg,
     generations: int = 4,
@@ -392,6 +580,7 @@ def run_full3d_optimization(
     target_volume = math.pi * float(cfg.radius) ** 2 * float(cfg.height)
     baseline = project_full3d_geometry(cfg, baseline, target_volume)
     baseline_metrics = evaluate_full3d_geometry(cfg, baseline)
+    baseline_metrics["archive_index"] = 0
     policy = Full3DUNetGNNPolicy().to(device)
     policy.eval()
     current = baseline
@@ -400,6 +589,7 @@ def run_full3d_optimization(
     history_geometries = [baseline]
     history_metrics = [dict(baseline_metrics, generation=0, step=0)]
     candidate_count = 1
+    archive_metrics = [dict(baseline_metrics)]
     amplitude = float(getattr(cfg, "max_depth", 1.6e-4))
 
     for generation in range(1, int(generations) + 1):
@@ -414,16 +604,21 @@ def run_full3d_optimization(
             geom = _apply_strategy_displacement(cfg, current, strategy, amplitude * float(rng.uniform(0.4, 1.4)))
             geom = project_full3d_geometry(cfg, geom, target_volume)
             metrics = evaluate_full3d_geometry(cfg, geom, baseline_metrics)
+            metrics["archive_index"] = int(candidate_count)
+            metrics["generation"] = int(generation)
             candidates.append((geom, metrics))
+            archive_metrics.append(dict(metrics))
             candidate_count += 1
-        geom, metrics = max(candidates, key=lambda item: item[1]["score"])
+        geom, metrics = _select_full3d_candidate(candidates)
         current = geom
-        if metrics["score"] > best_metrics["score"]:
-            best = geom
-            best_metrics = dict(metrics)
+        generation_best = _select_full3d_candidate([(best, best_metrics), *candidates])
+        if generation_best[1] is not best_metrics:
+            best, best_metrics = generation_best[0], dict(generation_best[1])
         history_geometries.append(best)
         history_metrics.append(dict(best_metrics, generation=generation, step=len(history_geometries) - 1))
         amplitude *= 0.82
+
+    selection_diagnostics = _full3d_selection_diagnostics(archive_metrics, best_metrics, baseline_metrics, cfg)
 
     return Full3DResult(
         best_geometry=best,
@@ -433,6 +628,8 @@ def run_full3d_optimization(
         history_geometries=history_geometries,
         history_metrics=history_metrics,
         candidate_count=candidate_count,
+        archive_metrics=archive_metrics,
+        selection_diagnostics=selection_diagnostics,
     )
 
 
@@ -475,7 +672,7 @@ def export_full3d_animation(
     output.mkdir(parents=True, exist_ok=True)
     frames = []
     for idx, geom in enumerate(geometries):
-        fig = plt.figure(figsize=(8, 5), dpi=120)
+        fig = plt.figure(figsize=(8, 5.0666666667), dpi=120)
         ax = fig.add_subplot(1, 1, 1, projection="3d")
         v = geom.vertices * 1.0e3
         tri = geom.faces
@@ -530,32 +727,40 @@ def save_full3d_summary(output_dir: str | Path, summary: Dict[str, object]) -> s
 def write_full3d_report(output_dir: str | Path, result: Full3DResult, summary: Dict[str, object]) -> str:
     path = Path(output_dir) / "design_strategy_report_full3d.md"
     lines = [
-        "# 真三维封闭几何优化报告",
+        "# Full 3D Closed-Mesh Optimization Report",
         "",
-        "## 物理规则",
+        "## Physics Rules",
         "",
-        "- 几何是封闭三维网格，侧面、顶面、底面均可参与优化。",
-        "- 两端 5mm 圆形电极边界保持直径与相对位置不变。",
-        "- 通电前体积投影到初始圆柱体积。",
-        "- 有效辐射按 0K、发射率 1 的外接球吸收面统计 0-3 微米净辐射。",
-        "- 策略生成器包含轻量 3D U-Net 编码器和图邻域平滑头。",
+        "- Geometry is a closed 3D mesh; side wall, top face, and bottom face can all move.",
+        "- The two 5 mm circular electrode boundaries keep their diameter and relative position fixed.",
+        "- Pre-energization volume is projected back to the initial cylinder volume.",
+        "- Effective radiation is 0-3 um net radiation escaping to a 0 K blackbody external sphere.",
+        "- The strategy generator is a lightweight 3D U-Net encoder plus graph-neighborhood smoothing head.",
         "",
-        "## 结果",
+        "## Selection",
         "",
-        f"- 0K 外接球有效辐射功率：`{summary.get('final_net_radiated_power_0k_sphere_w', 0.0):.6g} W`",
-        f"- 功率比：`{summary.get('power_ratio_full3d', 0.0):.6g}`",
-        f"- 寿命比：`{summary.get('lifetime_ratio_full3d', 0.0):.6g}`",
-        f"- 体积偏差：`{summary.get('volume_change_ratio_full3d', 0.0):.6g}`",
-        f"- 电极最大误差：`{summary.get('electrode_max_error_m', 0.0):.6g} m`",
-        f"- 温度违规比例：`{summary.get('temperature_violation_ratio', 0.0):.6g}`",
-        f"- 可行：`{summary.get('feasible', False)}`",
+        f"- Fixed voltage: `{summary.get('fixed_voltage_v', 0.0):.6g} V`",
+        f"- Selected archive index: `{summary.get('selected_archive_index', 0)}`",
+        f"- Feasible candidates: `{summary.get('archive_feasible_count', 0)} / {summary.get('archive_candidate_count', 0)}`",
+        f"- Selection reason: `{summary.get('selection_reason_full3d', '')}`",
         "",
-        "## 产物",
+        "## Results",
         "",
-        f"- STL：`{summary.get('stl')}`",
-        f"- STP：`{summary.get('stp')}`",
-        f"- GIF：`{summary.get('gif')}`",
-        f"- MP4：`{summary.get('mp4')}`",
+        f"- 0K sphere effective 0-3 um radiation: `{summary.get('final_net_radiated_power_0k_sphere_w', 0.0):.6g} W`",
+        f"- Power ratio: `{summary.get('power_ratio_full3d', 0.0):.6g}`",
+        f"- Lifetime ratio: `{summary.get('lifetime_ratio_full3d', 0.0):.6g}`",
+        f"- Max temperature: `{summary.get('max_temperature_k', 0.0):.6g} K`",
+        f"- Temperature violation ratio: `{summary.get('temperature_violation_ratio', 0.0):.6g}`",
+        f"- Volume error: `{summary.get('volume_change_ratio_full3d', 0.0):.6g}`",
+        f"- Electrode max error: `{summary.get('electrode_max_error_m', 0.0):.6g} m`",
+        f"- Feasible: `{summary.get('feasible', False)}`",
+        "",
+        "## Artifacts",
+        "",
+        f"- STL: `{summary.get('stl')}`",
+        f"- STP: `{summary.get('stp')}`",
+        f"- GIF: `{summary.get('gif')}`",
+        f"- MP4: `{summary.get('mp4')}`",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(path)
