@@ -590,3 +590,27 @@ C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_animation 
 ```
 
 结果：第一次 6 项通过；第二次 21 项非长训练测试通过。
+
+### 14.5 RTX4090 服务器验证
+
+用户在 RTX4090 Ubuntu 服务器执行：
+
+```bash
+python -u optimize_3d.py --smoke --experiment-name freecad_check_step --freecad-timeout 20
+```
+
+结果符合预期：
+
+- FreeCAD STEP 转换在 20 秒后超时返回：
+  - `[export] FreeCAD STEP conversion timed out after 20.0s; STL export is still valid.`
+- 脚本没有继续卡死，正常结束。
+- 输出目录：
+  - `outputs/three_d_runs/freecad_check_step_05-02-21-39`
+- 已生成：
+  - `optimized_cylinder_3d.stl`
+  - `topology_evolution_3d.gif`
+  - `run_summary_3d.json`
+  - `optimization_history_3d.csv`
+  - `design_strategy_report_3d.md`
+- `stp=None`：FreeCAD 超时后的预期结果。
+- `mp4=None`：仍是视频编码器链路问题，不影响 GIF 和核心 3D 产物。
