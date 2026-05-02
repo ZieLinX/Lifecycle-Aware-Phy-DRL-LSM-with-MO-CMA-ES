@@ -84,6 +84,7 @@ pip install rl-games gymnasium numpy scipy pyyaml tensorboard matplotlib imageio
 
 如果你需要 `.stp/.step`，再额外准备 FreeCAD CLI。没有 FreeCAD 也能正常训练，区别只是 STP 可能不会生成。  
 在真 3D 命令里也可以直接加 `--no-step` 跳过 STEP 导出。
+如果 FreeCAD 在 STL -> STEP 转换时长时间占用 CPU，优先停止当前进程并改用 `--no-step`；新版本会用 `--freecad-timeout` 限制等待时间，超时后保留 STL 并继续结束。
 
 ### 2.7 验证 GPU
 
@@ -124,6 +125,14 @@ python -u train_rl.py --smoke --experiment-name mcga_phy_drl_4090_smoke
 ```bash
 python -u optimize_3d.py --smoke --no-step --experiment-name mcga_3d_4090_smoke
 ```
+
+如果只想检查 FreeCAD STEP 导出是否可用，用很短超时单独试：
+
+```bash
+python -u optimize_3d.py --smoke --experiment-name freecad_check_step --freecad-timeout 20
+```
+
+若 20 秒内未完成，脚本会放弃 STEP、保留 STL/GIF，并把 `stp` 记为 `null`。
 
 ### 4.2 再跑 3D 正式优化
 
@@ -289,4 +298,5 @@ scp <user>@<host>:~/work/make_cylinder_great_again/3d_4090.log RTX4090/
 
 - 这是可选项，不影响核心训练
 - 先确认是否装了 FreeCAD CLI
+- 如果 FreeCAD 转换卡住，终止当前任务后拉取最新代码，使用 `--freecad-timeout 20` 检查；正式优化继续建议加 `--no-step`
 - 没有 FreeCAD 时，保留 STL 即可

@@ -372,6 +372,7 @@ def export_radius_field_mesh(radius_field: np.ndarray, cfg, output_dir: str, out
         output_name=output_name,
         export_step=export_step,
         freecad_cmd=getattr(cfg, "freecad_cmd", ""),
+        freecad_timeout_s=float(getattr(cfg, "freecad_timeout_s", 90.0)),
     )
 
 

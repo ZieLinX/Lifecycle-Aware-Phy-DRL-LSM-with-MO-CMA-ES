@@ -364,6 +364,7 @@ def _run_final_evaluation(base_config: dict, checkpoint_path: Path, args):
         output_name="optimized_cylinder",
         export_step=True,
         freecad_cmd=getattr(eval_cfg, "freecad_cmd", ""),
+        freecad_timeout_s=float(getattr(eval_cfg, "freecad_timeout_s", 90.0)),
     )
     animation_info = export_topology_evolution_animation(
         ring_radius_history=ring_history,
@@ -434,6 +435,7 @@ def main():
     parser.add_argument("--realtime-interval", type=int, default=4, help="Save realtime shape snapshot every N RL steps (0 = disabled)")
     parser.add_argument("--console-interval", type=int, default=20, help="Print live metrics every N RL steps (0 = disabled)")
     parser.add_argument("--torch-compile", action="store_true", help="Enable torch.compile in rl_games (may improve throughput).")
+    parser.add_argument("--freecad-timeout", type=float, default=90.0, help="Seconds to wait for FreeCAD STEP export during final eval.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
@@ -443,6 +445,7 @@ def main():
 
     _register_rl_games_env()
     config = _load_config(Path(args.config), args)
+    config["params"]["config"]["env_config"]["cfg"].freecad_timeout_s = float(args.freecad_timeout)
     runner = Runner()
     runner.load(config)
     runner.reset()

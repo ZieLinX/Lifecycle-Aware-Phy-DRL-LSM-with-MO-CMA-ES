@@ -195,6 +195,7 @@ class CylinderPhysicsCfg:
 
     # Export settings
     freecad_cmd = ""
+    freecad_timeout_s = 90.0
     log_interval = 1
 
 

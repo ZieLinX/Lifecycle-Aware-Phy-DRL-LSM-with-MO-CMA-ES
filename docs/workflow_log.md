@@ -532,3 +532,61 @@ python -u optimize_3d.py --smoke --no-step --experiment-name mcga_3d_4090_smoke
 - `mp4=None`：说明当前服务器视频编码器链路未写出 MP4；不影响 3D 优化和 GIF，可安装/修复 `ffmpeg`、`imageio-ffmpeg` 后重跑或后处理
 
 smoke 指标显示 baseline 与 final 几乎相同、`selected_archive_index=0`，这是 smoke 小种群/短跑预期现象，不代表正式 3D 优化质量。
+
+## 14. FreeCAD STEP smoke 卡住处理
+
+### 14.1 用户反馈
+
+用户在 RTX4090 Ubuntu 服务器执行：
+
+```bash
+python -u optimize_3d.py --smoke --experiment-name freecad_check_step
+```
+
+现象：日志停在 `[3d] device: NVIDIA GeForce RTX 4090` 后，GPU 负载未起来，一个 CPU 进程持续高占用，十几分钟不结束。
+
+判断：3D 优化 smoke 本身此前已能完成；这次没有 `--no-step`，卡住点高度可能是 FreeCAD CLI 在 STL -> STEP 转换阶段的 `makeShapeFromMesh` / `Part.makeSolid`。
+
+### 14.2 修复
+
+- `utils/exporter.py`
+  - FreeCAD subprocess 增加 `timeout`。
+  - 超时后打印提示并返回 `stp=None`，保留 STL/GIF/JSON 等产物，不再无限等待。
+- `config/cylinder_cfg.py`
+  - 新增 `freecad_timeout_s = 90.0`。
+- `optimize_3d.py`
+  - 新增命令行参数 `--freecad-timeout`。
+- `train_rl.py`
+  - final eval STEP 导出同样支持 `--freecad-timeout`。
+- `docs/cloud_train_rtx4090_zh.md`
+  - 补充 FreeCAD 卡住处理：正式优化继续建议 `--no-step`，STEP 单独用短超时检查。
+
+### 14.3 建议服务器操作
+
+当前卡住进程先停止：
+
+```bash
+Ctrl+C
+pkill -f FreeCADCmd || true
+pkill -f optimize_3d.py || true
+```
+
+拉最新代码后检查 STEP：
+
+```bash
+git pull origin xzh
+python -u optimize_3d.py --smoke --experiment-name freecad_check_step --freecad-timeout 20
+```
+
+若 20 秒内 FreeCAD 未完成，脚本应超时返回，`stp` 为 `None`，但 STL/GIF 仍保留。
+
+### 14.4 验证
+
+已通过：
+
+```bash
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_exporter_resolution tests.test_static_compile tests.test_hybrid_optimizer_3d
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_animation tests.test_exporter_resolution tests.test_feasibility tests.test_hybrid_optimizer tests.test_hybrid_optimizer_3d tests.test_physics_regression tests.test_planner tests.test_static_compile tests.test_transient tests.test_vec_env
+```
+
+结果：第一次 6 项通过；第二次 21 项非长训练测试通过。

@@ -28,6 +28,7 @@ def _configure_cfg(args, eval_mode: bool = False):
     cfg.thermal_max_iters = int(args.thermal_iters)
     cfg.shadow_slope_coeff = float(args.shadow_slope_coeff)
     cfg.shadow_roughness_coeff = float(args.shadow_roughness_coeff)
+    cfg.freecad_timeout_s = float(args.freecad_timeout)
     if args.smoke:
         cfg.num_segments = 32 if not eval_mode else 48
         cfg.num_rings = 24 if not eval_mode else 48
@@ -107,6 +108,7 @@ def main() -> None:
     parser.add_argument("--thermal-iters", type=int, default=640)
     parser.add_argument("--shadow-slope-coeff", type=float, default=0.01)
     parser.add_argument("--shadow-roughness-coeff", type=float, default=0.01)
+    parser.add_argument("--freecad-timeout", type=float, default=90.0, help="Seconds to wait for FreeCAD STEP export before falling back to STL only.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-step", action="store_true")
     parser.add_argument("--smoke", action="store_true")

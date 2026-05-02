@@ -104,7 +104,12 @@ def _resolve_freecad_command(freecad_cmd: str = "") -> Optional[str]:
     return matches[0] if matches else None
 
 
-def _run_freecad_stl_to_step(stl_path: str, step_path: str, freecad_cmd: str = "FreeCADCmd") -> bool:
+def _run_freecad_stl_to_step(
+    stl_path: str,
+    step_path: str,
+    freecad_cmd: str = "FreeCADCmd",
+    timeout_s: float = 90.0,
+) -> bool:
     """
     Convert STL mesh to STEP using FreeCAD command-line.
     Returns True on success, False otherwise.
@@ -139,10 +144,18 @@ print("STEP exported:", step_path)
             stderr=subprocess.PIPE,
             text=True,
             check=False,
+            timeout=max(float(timeout_s), 1.0),
         )
         if proc.returncode != 0:
             print(f"[export] FreeCAD STEP conversion failed: {proc.stderr.strip()}", flush=True)
         return proc.returncode == 0 and os.path.exists(step_path)
+    except subprocess.TimeoutExpired:
+        print(
+            f"[export] FreeCAD STEP conversion timed out after {float(timeout_s):.1f}s; "
+            "STL export is still valid. Re-run without --no-step only when STEP is required.",
+            flush=True,
+        )
+        return False
     finally:
         try:
             os.remove(tmp_script)
@@ -158,6 +171,7 @@ def export_mesh_files(
     output_name: str,
     export_step: bool = True,
     freecad_cmd: str = "FreeCADCmd",
+    freecad_timeout_s: float = 90.0,
 ) -> Dict[str, Optional[str]]:
     """
     Export current cylinder mesh to STL and optionally STEP/STP.
@@ -195,7 +209,12 @@ def export_mesh_files(
 
     step_written = False
     if export_step:
-        step_written = _run_freecad_stl_to_step(stl_path=stl_path, step_path=stp_path, freecad_cmd=freecad_cmd)
+        step_written = _run_freecad_stl_to_step(
+            stl_path=stl_path,
+            step_path=stp_path,
+            freecad_cmd=freecad_cmd,
+            timeout_s=freecad_timeout_s,
+        )
 
     return {
         "stl": stl_path,
@@ -215,6 +234,7 @@ def export_env_mesh(env, output_dir: str, output_name: str = "optimized_cylinder
         output_name=output_name,
         export_step=export_step,
         freecad_cmd=getattr(env.cfg, "freecad_cmd", ""),
+        freecad_timeout_s=float(getattr(env.cfg, "freecad_timeout_s", 90.0)),
     )
 
 
@@ -226,6 +246,7 @@ def export_ring_profile_mesh(
     output_name: str = "optimized_cylinder",
     export_step: bool = True,
     freecad_cmd: str = "",
+    freecad_timeout_s: float = 90.0,
 ):
     points = points_from_ring_profile(ring_radius=ring_radius, height=height, num_segments=num_segments)
     return export_mesh_files(
@@ -236,6 +257,7 @@ def export_ring_profile_mesh(
         output_name=output_name,
         export_step=export_step,
         freecad_cmd=freecad_cmd,
+        freecad_timeout_s=freecad_timeout_s,
     )
 
 
