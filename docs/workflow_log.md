@@ -730,3 +730,70 @@ C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_animation 
 - 3D/physics/static 组合测试 10 项通过。
 - 本地 CPU 3D smoke 正常生成 STL/GIF/MP4，并在 `run_summary_3d.json` 输出 `selection_reason_3d`、`best_feasible_nonbaseline_by_initial_power`、`max_nonbaseline_surface_area_ratio` 等诊断字段。
 - 非长训练全量单元测试 22 项通过。
+
+## 17. 体积守恒、形变动作与 Phy-DRL-LSM 思路评估
+
+### 17.1 当前体积守恒状态
+
+- 3D hybrid 路线 `optimize_3d.py` / `utils/hybrid_optimizer_3d.py`：
+  - `_project_radius_field()` 会固定两端电极环，对内部 `r(z, theta)` 做 slope/connectivity 限制，并按内部体积缩放半径。
+  - 目标体积为初始圆柱体积，当前 smoke 中 `volume_change_ratio_3d` 约为 `1e-7` 量级，属于数值误差。
+  - 注意：若 `min_radius`、端点固定、slope 限制冲突，理论上仍可能只保证在容差内；当前仍用 `volume_tolerance_ratio=0.02` 做最终约束。
+- 2D hybrid 路线 `optimize_hybrid.py` / `utils/hybrid_optimizer.py`：
+  - `_project_volume_and_connectivity()` 会固定端点、投影连通性/斜率，并缩放内部半径使体积接近初始体积。
+- RL 训练路线 `train_rl.py` / `envs/cylinder_vec_env.py`：
+  - action 输出三组策略场系数，组合成轴向速度场。
+  - `_project_volume_preserving_velocity()` 做一阶拉格朗日式速度投影：`sum(2*pi*r*dz*velocity)=0`。
+  - 之后还会 clamp 最小半径、固定端点、投影连通性；这些后处理可能重新引入小体积误差。
+  - 当前依靠 `volume_change_ratio` 惩罚和终止条件兜底，不是每步最终半径的严格体积重投影。
+- 旧 `CylinderPhysicsEnv` 点阵路线：
+  - 动作是局部 dent + 远场 compensation，并调用 `_enforce_volume_conservation()` 做近似体积修正。
+  - 后续 connected-profile 投影可能再次改变体积，因此也是容差/惩罚保证，不是严格数学等式保证。
+
+### 17.2 当前形变动作
+
+- RL 训练实际使用 `CylinderVecEnv`：
+  - `action_dim = 6 * 3 + 1 = 19`。
+  - 前 18 维 reshape 为 3 组、每组 6 个 Chebyshev 低阶系数。
+  - 三组策略场分别是 radiation / evaporation / current 权重场，经 sigmoid 映射为 `alpha_rad(z)`、`alpha_evap(z)`、`alpha_cur(z)`。
+  - 物理敏度为 `rad=temp_norm^4`、`evap=recession_rate_norm`、`cur=1/r^2`。
+  - 几何速度：`raw_velocity = alpha_rad*rad - alpha_evap*evap + alpha_cur*cur`，再体积投影、缩放并更新 `ring_radius(z)`。
+  - 最后一维 action 为 dwell，用于 transient 采样时间策略。
+- 3D hybrid 路线：
+  - 不是 RL action，而是 CEM 搜索 Chebyshev axial modes 与 Fourier circum modes 的系数。
+  - 几何是 `r(z, theta)`，支持非轴对称 3D 起伏；候选经 `_project_radius_field()` 投影到体积/端点/斜率约束空间。
+- 旧点阵环境：
+  - action 为 `[index_ratio, indentation, sigma]`，可选第四维 dwell。
+  - 表示在圆柱表面某一点做局部凹陷，并在远场补偿隆起。
+
+### 17.3 对 Phy-DRL-LSM 方案的借鉴判断
+
+- 已经可以直接借鉴：
+  - “RL 不直接编辑体素，而输出物理策略权重场”这一点已经和当前 `CylinderVecEnv` 一致，但当前是一维轴向场。
+  - 体积守恒拉格朗日投影可升级为 action 后最终半径重投影，弥补 clamp/connectivity 后的体积漂移。
+  - 输出 `alpha_rad/alpha_evap/alpha_cur` 的历史可做可解释性产物，解释何时、何地、为何增材/减材。
+- 适合下一阶段实现：
+  - 把 `CylinderVecEnv` 从 `r(z)` 扩展到 `r(z, theta)`，复用当前 3D hybrid 的 basis/projection/physics。
+  - 在 3D action 中使用低阶二维基函数输出三个策略场，而不是直接上体素级 3D U-Net。
+  - 每次 action 后调用和 3D hybrid 类似的最终体积投影，保证最终几何体积在数值误差内不变。
+- 暂不建议直接上：
+  - 完整体素 SDF + level-set + 3D U-Net/MinkowskiEngine/GNN surrogate。实现量很大，依赖重，且当前圆柱任务的有效自由度未必需要完整拓扑优化。
+  - 严格 0.1 mm 体素化会让 5 mm x 15 mm 圆柱网格较粗，容易引入台阶误差；当前 `r(z, theta)` 曲面参数化更适合 STL/GIF/物理求解闭环。
+
+### 17.4 建议路线
+
+短期优先做“3D Phy-DRL low-order strategy fields”：
+
+1. 新增 `Cylinder3DVecEnv`，状态为 `r(z, theta)`、温度场、蒸发率、view factor proxy。
+2. action 输出三组低阶 2D basis 系数：`alpha_rad(z,theta)`、`alpha_evap(z,theta)`、`alpha_cur(z,theta)`，另加 dwell。
+3. 用当前 3D rated-condition 和 transient 作为内环额定工况搜索。
+4. action 后做最终体积/连通/斜率投影，并把 `volume_change_ratio_3d` 控制到 `1e-5` 或更低。
+5. 导出 alpha 权重云图/GIF，作为可解释性报告的一部分。
+
+### 17.5 需要修正的题目规则
+
+- 当前 3D hybrid 仍固定 `r[:,0,:]` 和 `r[:,-1,:]` 为 2.5mm，等价于把两端截面都固定为圆形；这不符合用户新要求“圆柱底面和顶面也可以被改变，只要求电极一定是 5mm 圆形”。
+- 下一阶段应把“电极”从“整张顶/底圆面固定”改为“外部电路连接点/连接环保持直径 5mm 和相对位置不变”，而优化体可以在靠近端面的非电极区域改变形状。
+- 当前 `r(z,theta)` 表示的是沿 z 轴单值半径场，天然不支持真正任意拓扑、端面起伏或内腔；若要允许顶/底面自由变形，至少要升级为端面可变的封闭 star-shaped surface，或转向 SDF/level-set 表示。
+- 题目中的外接球应建模为 0K、发射率 1 的吸收面；有效辐射目标应是能从器件表面到达外接球、处于 0-3 微米波段的净辐射功率。当前代码使用 `view_factor_proxy` 和遮挡 proxy，不是严格外接球可见性积分。
+- 最佳可落地方案应先做“封闭曲面 + 低阶 3D 策略场 + 体积投影 + 外接球可见性采样”，再考虑完整体素 SDF/level-set。
