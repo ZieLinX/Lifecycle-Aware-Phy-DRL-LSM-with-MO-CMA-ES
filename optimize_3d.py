@@ -43,7 +43,7 @@ def _configure_cfg(args, eval_mode: bool = False):
     cfg.hybrid3d_max_log_delta = float(args.max_log_delta)
     cfg.hybrid3d_circum_penalty = float(args.circum_penalty)
     cfg.full3d_use_neural_policy = bool(args.full3d_neural_policy)
-    cfg.full3d_fixed_voltage_v = float(args.fixed_voltage)
+    cfg.full3d_fixed_voltage_v = None if args.fixed_voltage is None else float(args.fixed_voltage)
     cfg.full3d_volume_tolerance_ratio = float(args.full3d_volume_tolerance)
     cfg.full3d_cap_rings = int(args.cap_rings)
     if args.smoke:
@@ -86,7 +86,7 @@ def _run_full3d_backend(args) -> None:
     base_power = max(float(result.baseline_metrics.get("net_radiated_power_0k_sphere_w", 0.0)), 1.0e-9)
     final_power = float(result.best_metrics.get("net_radiated_power_0k_sphere_w", 0.0))
     summary = {
-        "method": "full3d_unet_gnn_policy_closed_mesh_0k_sphere",
+        "method": "full3d_unet_gnn_policy_closed_mesh_300k_sink",
         "backend": "full3d",
         "device": args.device,
         "candidate_count": int(result.candidate_count),
@@ -96,12 +96,30 @@ def _run_full3d_backend(args) -> None:
         "top_bottom_faces_variable": True,
         "electrode_constraint": "two 5 mm circular electrode boundaries remain fixed in diameter and relative position",
         "volume_constraint": "pre-energization closed-mesh volume is projected to the initial cylinder volume",
-        "external_sphere": "0 K blackbody sphere, emissivity 1, receives escaped 0-3 um radiation",
+        "thermal_boundary": "300 K fixed-temperature electrode ends plus 300 K free-surface radiative sink; end faces in contact with electrodes do not radiate or sublime",
+        "external_sphere": "legacy field: optical target is escaped 0-3 um free-surface radiation; thermal balance uses the 300 K sink fields",
         "policy_model": "lightweight 3D U-Net encoder with graph-neighborhood smoothing head",
-        "fixed_voltage_v": float(train_cfg.full3d_fixed_voltage_v),
+        "voltage_search_mode": str(result.best_metrics.get("voltage_search_mode", result.selection_diagnostics.get("voltage_search_mode", ""))),
+        "voltage_constraint": (
+            f"fixed diagnostic voltage {float(train_cfg.full3d_fixed_voltage_v):.6g} V"
+            if train_cfg.full3d_fixed_voltage_v is not None
+            else f"rated voltage is searched under V <= {float(train_cfg.max_voltage):.6g} V; max voltage is not a fixed operating point"
+        ),
+        "fixed_voltage_v": None if train_cfg.full3d_fixed_voltage_v is None else float(train_cfg.full3d_fixed_voltage_v),
+        "rated_voltage_upper_bound_v": float(train_cfg.max_voltage),
+        "baseline_voltage_v": float(result.baseline_metrics.get("voltage_v", 0.0)),
+        "final_voltage_v": float(result.best_metrics.get("voltage_v", 0.0)),
         "baseline_feasible_full3d": bool(result.baseline_metrics.get("constraint_feasible_3d", False)),
         "baseline_net_radiated_power_0k_sphere_w": base_power,
         "final_net_radiated_power_0k_sphere_w": final_power,
+        "final_net_radiated_power_300k_environment_w": float(result.best_metrics.get("net_radiated_power_300k_environment_w", final_power)),
+        "thermal_radiation_sink_temperature_k": float(result.best_metrics.get("thermal_radiation_sink_temperature_k", train_cfg.ambient_temp)),
+        "electrode_boundary_temperature_k": float(result.best_metrics.get("electrode_boundary_temperature_k", train_cfg.ambient_temp)),
+        "tungsten_voltage_v": float(result.best_metrics.get("tungsten_voltage_v", result.best_metrics.get("voltage_v", 0.0))),
+        "electrode_voltage_drop_v": float(result.best_metrics.get("electrode_voltage_drop_v", 0.0)),
+        "contact_end_face_area_m2": float(result.best_metrics.get("contact_end_face_area_m2", 0.0)),
+        "free_radiating_surface_area_m2": float(result.best_metrics.get("free_radiating_surface_area_m2", 0.0)),
+        "thermal_converged": bool(result.best_metrics.get("thermal_converged", False)),
         "power_ratio_full3d": final_power / base_power,
         "baseline_lifetime_s_full3d": float(result.baseline_metrics.get("lifetime_s", 0.0)),
         "final_lifetime_s_full3d": float(result.best_metrics.get("lifetime_s", 0.0)),
@@ -303,7 +321,7 @@ def main() -> None:
     parser.add_argument("--max-log-delta", type=float, default=0.160, help="Clamp log radius perturbations to +/- this value before projection.")
     parser.add_argument("--circum-penalty", type=float, default=0.35, help="Score penalty weight for circumferential nonuniformity.")
     parser.add_argument("--freecad-timeout", type=float, default=90.0, help="Seconds to wait for FreeCAD STEP export before falling back to STL only.")
-    parser.add_argument("--fixed-voltage", type=float, default=100.0, help="Voltage for the full3d closed-mesh backend, matching the task statement.")
+    parser.add_argument("--fixed-voltage", type=float, default=None, help="Optional full3d diagnostic voltage. Omit to search the rated voltage under --max-voltage.")
     parser.add_argument("--cap-rings", type=int, default=8, help="Radial discretization rings per movable end face for full3d backend.")
     parser.add_argument("--full3d-volume-tolerance", type=float, default=1.0e-5, help="Closed-mesh volume tolerance for full3d feasibility.")
     parser.add_argument("--full3d-neural-policy", action=argparse.BooleanOptionalAction, default=True, help="Use the lightweight 3D U-Net/GNN strategy generator in full3d backend.")

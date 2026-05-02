@@ -4,7 +4,7 @@
 仓库里有两条路线，必须分开理解：
 
 1. `train_rl.py` 是**轴对称 RL 路线**，训练的是 ring profile / 剖面策略。
-2. `optimize_3d.py` 是**真 3D 路线**，直接优化 `r(z, theta)` 三维半径场。
+2. `optimize_3d.py` 是**真 3D 路线**；默认 `full3d` 后端使用封闭三维网格，旧 `sidefield` 后端才是 `r(z, theta)` 半径场。
 
 ## 1. 两条路线和产物
 
@@ -53,7 +53,13 @@ sudo apt-get install -y git tmux htop ffmpeg
 - 几何是封闭三维网格，不是轴对称剖面，也不是只优化侧面 `r(z,theta)`。
 - 侧面、顶面、底面都可以改变；两端 5mm 圆形电极边界保持直径和相对位置不变。
 - 通电前体积按封闭 mesh 体积投影回初始圆柱体积。
-- 有效辐射按 0K、发射率 1 的外接球吸收面统计 0-3 微米净辐射。
+- 钨棒内部显式计算轴向导热；两端接触铜电极按 `300K` 固定温度边界处理，当前口径忽略接触热阻和接触电阻。
+- 电压只加在钨棒两端，不包含铜电极电压降。
+- 有效辐射按 0K、发射率 1 的外接球吸收面统计 0-3 微米净辐射；自由表面还计算向 `300K` 环境的净辐射/散热和升华。
+- 端面接触电极的区域不计向外辐射和升华；只有自由表面参与这些表面损失/收益。
+- 默认会搜索 `V <= 100V` 的额定工况，不把 100V 或 20V 当成固定工作电压；`100V` 只是额定搜索上限。
+- 额定搜索选择综合辐射收益和蒸发/寿命后的最优稳态，并要求该稳态电压 `<=100V`。初始 5mm x 15mm 圆柱的额定电压约 `0.34V`，可作为判断固定高电压是否离谱的口径参考。
+- `--fixed-voltage <V>` 仅用于诊断固定电压下是否过温，不建议作为正式优化命令使用。
 - 策略生成器包含轻量 3D U-Net 编码器和图邻域平滑头。
 
 快速检查：
@@ -61,6 +67,14 @@ sudo apt-get install -y git tmux htop ffmpeg
 ```bash
 python -u optimize_3d.py --backend full3d --smoke --no-step --experiment-name full3d_smoke
 ```
+
+如果要复查固定电压为什么不可行，可以显式加诊断参数：
+
+```bash
+python -u optimize_3d.py --backend full3d --smoke --no-step --experiment-name full3d_fixed20_diag --fixed-voltage 20
+```
+
+该模式下若 `archive_feasible_count=0`，说明固定电压工况本身过温；正式优化应去掉 `--fixed-voltage`，让程序搜索额定电压。注意：固定 20V/100V 不是题目正式口径，正式口径是从 `V<=100V` 中选最优稳态。
 
 正式跑：
 

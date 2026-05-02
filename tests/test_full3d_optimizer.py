@@ -25,9 +25,12 @@ class Full3DOptimizerTest(unittest.TestCase):
         cfg.num_segments = 16
         cfg.num_rings = 10
         cfg.full3d_cap_rings = 4
-        cfg.full3d_fixed_voltage_v = 100.0
+        cfg.full3d_fixed_voltage_v = None
         cfg.full3d_volume_tolerance_ratio = 1.0e-5
-        cfg.thermal_max_iters = 20
+        cfg.voltage_grid_points = 9
+        cfg.voltage_refine_levels = 1
+        cfg.voltage_refine_points = 7
+        cfg.thermal_max_iters = 80
         return cfg
 
     def test_baseline_closed_mesh_preserves_volume_and_electrodes(self) -> None:
@@ -40,6 +43,14 @@ class Full3DOptimizerTest(unittest.TestCase):
         self.assertLessEqual(metrics["electrode_max_error_m"], cfg.full3d_electrode_tolerance_m)
         self.assertEqual(metrics["external_sphere_temperature_k"], 0.0)
         self.assertEqual(metrics["external_sphere_emissivity"], 1.0)
+        self.assertEqual(metrics["thermal_radiation_sink_temperature_k"], cfg.ambient_temp)
+        self.assertEqual(metrics["electrode_boundary_temperature_k"], cfg.ambient_temp)
+        self.assertEqual(metrics["electrode_voltage_drop_v"], 0.0)
+        self.assertAlmostEqual(metrics["tungsten_voltage_v"], metrics["voltage_v"])
+        self.assertGreater(metrics["contact_end_face_area_m2"], 0.0)
+        self.assertGreater(metrics["free_radiating_surface_area_m2"], 0.0)
+        self.assertLess(metrics["free_radiating_surface_area_m2"], metrics["surface_area_m2"])
+        self.assertTrue(metrics["thermal_converged"])
 
     def test_full3d_temperature_responds_to_fixed_voltage(self) -> None:
         cfg = self._small_cfg()
@@ -52,6 +63,18 @@ class Full3DOptimizerTest(unittest.TestCase):
         self.assertLess(low_voltage["temperature_violation_ratio"], high_voltage["temperature_violation_ratio"])
         self.assertAlmostEqual(low_voltage["voltage_v"], 20.0)
         self.assertAlmostEqual(high_voltage["voltage_v"], 100.0)
+
+    def test_full3d_default_searches_rated_voltage(self) -> None:
+        cfg = self._small_cfg()
+        geom = project_full3d_geometry(cfg, build_baseline_full3d_geometry(cfg), math.pi * cfg.radius * cfg.radius * cfg.height)
+        metrics = evaluate_full3d_geometry(cfg, geom)
+        self.assertEqual(metrics["voltage_search_mode"], "rated_search")
+        self.assertGreaterEqual(metrics["voltage_v"], cfg.min_voltage)
+        self.assertLessEqual(metrics["voltage_v"], cfg.max_voltage)
+        self.assertGreater(metrics["voltage_search_evaluations"], 1)
+        self.assertGreater(metrics["voltage_v"], 0.20)
+        self.assertLess(metrics["voltage_v"], 0.50)
+        self.assertTrue(metrics["thermal_converged"])
 
     def test_unet_gnn_policy_smoke(self) -> None:
         model = Full3DUNetGNNPolicy()
@@ -90,6 +113,7 @@ class Full3DOptimizerTest(unittest.TestCase):
         self.assertIn("net_radiated_power_0k_sphere_w", result.best_metrics)
         self.assertIn("selection_reason_full3d", result.selection_diagnostics)
         self.assertEqual(result.selection_diagnostics["archive_candidate_count"], result.candidate_count)
+        self.assertEqual(result.selection_diagnostics["voltage_search_mode"], "rated_search")
         self.assertLessEqual(result.best_metrics["volume_change_ratio_3d"], 5.0e-5)
         self.assertTrue(result.best_metrics["top_bottom_faces_variable"])
 

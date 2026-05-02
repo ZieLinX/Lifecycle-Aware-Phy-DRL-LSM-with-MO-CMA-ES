@@ -908,3 +908,79 @@ C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_animation 
 - 完整非长训练测试集 27 项通过。
 - 本地探针显示固定电压已生效：5V、10V、20V、50V、100V 输出不同温度，20V 不再被报告为原来的裁剪值 `4909.725K`。
 - 在当前简化模型下 20V 仍超温，summary 会明确写 `archive_feasible_count=0` 和 `selection_reason_full3d=no full3d candidate satisfied fixed-voltage...`。
+
+## 20. full3d 默认改回额定电压搜索
+
+### 20.1 RTX4090 复测结果
+
+用户在 RTX4090 Ubuntu 服务器拉取最新 `xzh` 后执行：
+
+```bash
+python -u optimize_3d.py --backend full3d --smoke --no-step --experiment-name full3d_v_sweep --fixed-voltage 20
+```
+
+结果确认：
+
+- `fixed_voltage_v=20.0`，说明参数已生效。
+- `max_temperature_k=6292.129150390625`，不再是旧裁剪值 `4909.725K`。
+- `archive_feasible_count=0`，固定 20V 工况下所有 full3d 候选都过温/不可行。
+- `mp4` 正常生成，且未再出现 imageio macro-block resize 警告。
+
+### 20.2 判断
+
+该结果不是“电压参数失效”，而是固定电压诊断揭示了更核心的物理问题：5mm x 15mm 钨柱电阻极低，若强行固定 20V，焦耳功率达到 `4.247e5 W` 量级，远超 3000 摄氏度约束。仓库既有题意判断和文档均指向：`100V` 是电压上限，正式评估应搜索 `V <= 100V` 的额定工况，而不是把 20V 或 100V 作为固定工作点。
+
+### 20.3 修复内容
+
+- `config/cylinder_cfg.py`
+  - `full3d_fixed_voltage_v` 默认从 `100.0` 改为 `None`。
+  - `None` 表示 full3d 默认做额定电压搜索；设为浮点数时进入固定电压诊断模式。
+- `optimize_3d.py`
+  - `--fixed-voltage` 改为可选参数，默认不传。
+  - summary 增加 `voltage_search_mode`、`voltage_constraint`、`baseline_voltage_v`、`final_voltage_v`、`rated_voltage_upper_bound_v`。
+- `utils/full3d_optimizer.py`
+  - `evaluate_full3d_geometry()` 拆为固定电压评估和额定电压搜索两层。
+  - 默认对 `min_voltage..max_voltage` 做粗搜与局部细化，优先选择满足温度、寿命、体积、电极约束的可行电压。
+  - `--fixed-voltage <V>` 仍保留，用于复查固定电压为什么不可行。
+  - `selection_reason_full3d` 区分 fixed-voltage 与 rated-search 两种模式。
+- `docs/cloud_train_rtx4090_zh.md`
+  - 明确正式 full3d 命令不要加 `--fixed-voltage`。
+  - 补充固定电压诊断命令和 `archive_feasible_count=0` 的解释。
+- `tests/test_full3d_optimizer.py`
+  - 新增默认额定电压搜索回归测试。
+  - 保留显式 fixed-voltage 温度响应测试。
+
+## 21. full3d 物理口径补充：电极边界、自由表面与额定搜索
+
+### 21.1 本轮文档修正范围
+
+本轮只做文档口径同步，不修改代码文件，不运行长测试。写入范围限定为：
+
+- `docs/workflow_log.md`
+- `docs/cloud_train_rtx4090_zh.md`
+
+### 21.2 full3d 物理边界口径
+
+- 钨棒需要显式计算轴向导热。
+- 两端接触铜电极按 `300K` 固定温度边界处理。
+- 当前口径忽略钨棒-铜电极之间的接触热阻和接触电阻。
+- 电压只加在钨棒两端，不包含铜电极电压降。
+- 自由表面计算向 `300K` 环境的净辐射/散热和升华。
+- 端面接触电极的区域不计向外辐射，也不计升华；只有自由表面参与这些表面损失和收益。
+
+### 21.3 额定电压搜索口径
+
+- `100V` 是额定搜索上限，不是固定工作电压。
+- full3d 正式优化不应在命令里加 `--fixed-voltage 100` 或 `--fixed-voltage 20`。
+- 额定搜索应在 `V <= 100V` 的候选稳态中，选择综合辐射收益和蒸发/寿命后的最优稳态。
+- 被选中的最优稳态电压必须满足 `<=100V`。
+- 初始 5mm x 15mm 圆柱的额定电压约 `0.34V`，可作为口径说明：固定 20V/100V 会显著偏离正式额定搜索含义，通常只适合作为过温诊断。
+
+### 21.4 RTX4090 文档同步
+
+`docs/cloud_train_rtx4090_zh.md` 的 full3d 段落已同步：
+
+- 明确默认 full3d 后端是封闭三维网格，旧 `sidefield` 才是 `r(z, theta)` 半径场。
+- 补充轴向导热、300K 铜电极固定温度边界、电压只跨钨棒、端面接触区不计辐射/升华的说明。
+- 正式命令保持不加 `--fixed-voltage`，继续让程序搜索 `V<=100V` 的额定工况。
+- 固定电压命令仅保留为诊断模式，并明确固定 20V/100V 不是正式优化口径。

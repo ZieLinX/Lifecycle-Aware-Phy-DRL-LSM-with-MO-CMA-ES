@@ -210,7 +210,17 @@ class CylinderPhysicsCfg:
     full3d_cap_max_displacement_m = 4.0e-4
     full3d_volume_tolerance_ratio = 1.0e-5
     full3d_electrode_tolerance_m = 2.0e-6
-    full3d_fixed_voltage_v = 100.0
+    # None means full3d searches the rated operating voltage under max_voltage.
+    # A float value enables fixed-voltage diagnostic mode.
+    full3d_fixed_voltage_v = None
+    # Thermal balance uses room-temperature surroundings for free-surface
+    # radiation. The 0 K sphere terminology is kept only for old reports.
+    full3d_thermal_sink_temperature_k = 300.0
+    full3d_thermal_residual_tol_w = 1.0e-3
+    full3d_thermal_max_delta_k = 1200.0
+    full3d_lifecycle_reference_s = 1.0e27
+    full3d_lifetime_recession_floor_m_s = 1.0e-300
+    full3d_lifetime_cap_s = 1.0e300
     full3d_sphere_temperature_k = 0.0
     full3d_sphere_emissivity = 1.0
     full3d_escape_floor = 0.10
