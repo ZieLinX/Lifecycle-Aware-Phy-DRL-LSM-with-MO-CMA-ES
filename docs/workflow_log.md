@@ -488,3 +488,47 @@ C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_animation 
 ```
 
 结果：第一次 8 项通过；第二次 20 项非长训练测试通过。
+
+## 13. RTX4090 Ubuntu smoke 通过记录
+
+### 13.1 RL smoke
+
+用户在 RTX4090 Ubuntu 服务器执行：
+
+```bash
+python -u train_rl.py --smoke --experiment-name mcga_phy_drl_4090_smoke
+```
+
+结果：
+
+- CUDA 设备：`NVIDIA GeForce RTX 4090`
+- 训练完成并保存 checkpoint：
+  - `outputs/rl_runs/mcga_phy_drl_4090_smoke_02-20-38-01/nn/last_mcga_phy_drl_4090_smoke_ep_1_rew__30.59399_.pth`
+- 训练过程 GIF 已生成：
+  - `outputs/rl_runs/mcga_phy_drl_4090_smoke/realtime/training_evolution.gif`
+- final eval 已完成：
+  - `outputs/final_eval/mcga_phy_drl_4090_smoke_02-20-38-01`
+
+说明：该路线仍为轴对称 RL，用于 smoke 和对照，不是真 3D 优化。
+
+### 13.2 真 3D smoke
+
+用户在 RTX4090 Ubuntu 服务器执行：
+
+```bash
+python -u optimize_3d.py --smoke --no-step --experiment-name mcga_3d_4090_smoke
+```
+
+结果目录：
+
+- `outputs/three_d_runs/mcga_3d_4090_smoke_05-02-20-39`
+
+关键结果：
+
+- `optimized_cylinder_3d.stl` 已生成
+- `topology_evolution_3d.gif` 已生成
+- `run_summary_3d.json` / `optimization_history_3d.csv` / `design_strategy_report_3d.md` 已生成
+- `stp=None`：符合预期，因为命令使用了 `--no-step`
+- `mp4=None`：说明当前服务器视频编码器链路未写出 MP4；不影响 3D 优化和 GIF，可安装/修复 `ffmpeg`、`imageio-ffmpeg` 后重跑或后处理
+
+smoke 指标显示 baseline 与 final 几乎相同、`selected_archive_index=0`，这是 smoke 小种群/短跑预期现象，不代表正式 3D 优化质量。
