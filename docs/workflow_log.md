@@ -1135,3 +1135,97 @@ C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe optimize_3d.py --device cpu --smo
 - smoke 中 `baseline_voltage_v = 0.34`，`final_voltage_v = 0.34`，仍为额定搜索。
 - summary 输出 `electrode_contact_area_m2`、`noncontact_end_face_area_m2`、`missing_electrode_contact_area_m2`。
 - `electrode_max_error_m = 0.0` 表示端距/端面 z 约束满足，不再表示端面半径必须等于 `2.5mm`。
+
+## 25. full3d 全局初始形状策略场 CEM 口径同步
+
+### 25.1 本轮用户要求
+
+用户明确当前代码方向已从“圆柱附近局部形变 CEM”改为 **Phy-DRL-LSM inspired global initial-shape strategy-field CEM**。因此后续文档和运行解释不得再把指定 `5mm x 15mm` 圆柱理解为默认最优初始形状或局部微扰中心。
+
+当前统一口径：
+
+- 指定圆柱只作为通电前材料体积基准和寿命 baseline。
+- 每个 action 直接生成一个完整的通电前初始几何，而不是在圆柱附近做少量局部修补。
+- 每个候选几何仍保持两端平面距离 `15mm`，且材料体积与初始圆柱相等。
+- 两端固定电极仍为 `5mm` 圆盘；钨端面 footprint 可变，电极导热按 footprint 与固定电极圆盘的重叠面积计算。
+- 所有端面不参与辐射、不参与升华；只有自由侧表面参与向 `300K` 环境的净辐射散热和蒸发寿命计算。
+- 每个候选几何都在内环搜索 `V <= 100V` 的额定稳态；`100V` 只是上限，最优额定电压不要求接近 `100V`。
+- 评分主目标改为额定工况下 `0-3um` escaped energy-conversion efficiency，而不是单纯净辐射功率。
+- 硬约束仍包括 `lifetime >= 30% baseline`、`T <= 3000C`、体积相等、端距/电极边界满足要求。
+
+### 25.2 动作空间口径
+
+full3d action 输出四类 strategy map：
+
+1. `radiation`
+2. `evaporation`
+3. `current`
+4. `direct`
+
+这些 strategy map 与局部物理敏度组合为自由表面的法向速度场，再通过 Lagrange 体积保持投影生成全局初始几何。该流程借鉴 Phy-DRL-LSM 的“物理策略场 + 体积约束投影”思想，但当前优化器使用 CEM 在策略场参数空间中搜索。
+
+上下端面 footprint 继续使用平面内模式，不做端面轴向位移；端距固定为 `15mm`。电极固定 `5mm` 圆盘，不随钨端面 footprint 变形；导热强度由两者重叠面积决定。
+
+### 25.3 文档与 summary 字段同步
+
+后续运行/方案文档应重点检查以下字段，确认运行的是全局初始形状策略场口径：
+
+- `optimization_target_full3d`
+- `strategy_channels_full3d`
+- `global_shape_steps_full3d`
+- `final_energy_conversion_efficiency_0_3um`
+- `energy_conversion_efficiency_ratio`
+
+其中：
+
+- `optimization_target_full3d` 应说明目标为 rated-condition `0-3um` escaped energy-conversion efficiency，并包含 `V<=100V`、体积相等、温度和寿命约束。
+- `strategy_channels_full3d` 默认应为 `4`，对应 radiation / evaporation / current / direct。
+- `global_shape_steps_full3d` 表示每个 action 生成完整初始几何时的全局策略场推进步数。
+- `final_energy_conversion_efficiency_0_3um` 是正式主目标字段。
+- `energy_conversion_efficiency_ratio` 用于和初始圆柱 baseline 对比。
+
+### 25.4 代码修改范围
+
+本轮同步完成了代码实现和文档口径，核心代码修改范围包括：
+
+- `utils/full3d_optimizer.py`
+  - 移除 `project_full3d_geometry()` 中相对圆柱的小位移截断，允许同体积材料在更大全局空间内重分布。
+  - 新增 global initial-shape strategy-field action：四类 strategy map 与物理敏度组合为法向速度场，并做 Lagrange 体积保持投影。
+  - 新增 `build_full3d_initial_shape_from_action()`，每个 action 从圆柱材料基准直接生成完整通电前初始几何。
+  - CEM 主循环改为在全局初始形状 action 空间中采样和更新，而不是从上一代几何做局部小步扰动。
+  - 额定工况内环保留 `V <= 100V` 搜索，但电压上限不作为优化目标；主评分改为 `0-3um` energy-conversion efficiency。
+- `config/cylinder_cfg.py`
+  - 新增 `full3d_action_strategy_channels`、`full3d_global_shape_steps`、`full3d_global_step_m`、`full3d_global_step_decay`、`full3d_global_max_radius_m`、`full3d_neural_policy_amplitude_m`。
+- `optimize_3d.py`
+  - 新增 CLI 参数 `--action-strategy-channels`、`--global-shape-steps`、`--global-step-m`、`--global-max-radius-m`。
+  - summary 新增 `optimization_target_full3d`、`strategy_channels_full3d`、`global_shape_steps_full3d`、`final_energy_conversion_efficiency_0_3um`、`energy_conversion_efficiency_ratio`。
+- `tests/test_full3d_optimizer.py`
+  - 新增全局初始形状 action 回归测试，确认生成几何不是圆柱附近微扰，并保持同体积与额定电压约束。
+
+文档同步范围包括：
+
+- `docs/workflow_log.md`
+- `docs/research_solution_zh.md`
+- `docs/cloud_train_rtx4090_zh.md`
+
+### 25.5 本地验证
+
+已通过：
+
+```bash
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest discover -s tests -p "test_*.py"
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe optimize_3d.py --device cpu --smoke --no-step --experiment-name codex_global_initial_shape_smoke --output-dir outputs/three_d_runs --generations 1 --population-size 3 --thermal-iters 120
+```
+
+CPU smoke 摘要：
+
+- `method = full3d_phydrl_lsm_cem_global_initial_shape_300k_sink`
+- `voltage_search_mode = rated_search`
+- `baseline_voltage_v = 0.34`
+- `final_voltage_v = 0.3`
+- `final_energy_conversion_efficiency_0_3um = 0.0037781866984802665`
+- `energy_conversion_efficiency_ratio = 2.360031453348258`
+- `selected_archive_index = 2`
+- `selection_reason_full3d = selected feasible globally parameterized initial shape with highest constrained rated-efficiency score`
+
+该结果说明 smoke 已选中非基线的全局初始形状候选；`final_voltage_v` 没有接近 `100V`，符合“100V 只是上限而不是目标电压”的物理口径。

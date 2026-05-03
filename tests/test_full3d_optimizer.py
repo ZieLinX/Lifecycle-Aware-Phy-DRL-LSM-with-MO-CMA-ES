@@ -11,6 +11,7 @@ from utils.full3d_optimizer import (
     Full3DUNetGNNPolicy,
     _apply_strategy_displacement,
     _apply_full3d_topology_action,
+    build_full3d_initial_shape_from_action,
     build_baseline_full3d_geometry,
     evaluate_full3d_geometry,
     full3d_action_dim,
@@ -29,6 +30,14 @@ class Full3DOptimizerTest(unittest.TestCase):
         cfg.full3d_cap_rings = 4
         cfg.full3d_fixed_voltage_v = None
         cfg.full3d_volume_tolerance_ratio = 1.0e-5
+        cfg.full3d_action_axial_modes = 3
+        cfg.full3d_action_circum_modes = 2
+        cfg.full3d_action_cap_radial_modes = 3
+        cfg.full3d_action_strategy_channels = 4
+        cfg.full3d_global_shape_steps = 2
+        cfg.full3d_global_step_m = 7.0e-4
+        cfg.full3d_global_max_radius_m = 5.0e-3
+        cfg.full3d_neural_policy_amplitude_m = 3.0e-5
         cfg.voltage_grid_points = 9
         cfg.voltage_refine_levels = 1
         cfg.voltage_refine_points = 7
@@ -150,7 +159,11 @@ class Full3DOptimizerTest(unittest.TestCase):
         )
         action = np.zeros(full3d_action_dim(cfg), dtype=np.float64)
         action[0] = 1.0
-        side_dim = cfg.full3d_action_axial_modes * (1 + 2 * cfg.full3d_action_circum_modes)
+        side_dim = (
+            cfg.full3d_action_strategy_channels
+            * cfg.full3d_action_axial_modes
+            * (1 + 2 * cfg.full3d_action_circum_modes)
+        )
         action[side_dim] = 1.0
         moved = _apply_full3d_topology_action(cfg, baseline, action, float(cfg.max_depth))
         moved = project_full3d_geometry(cfg, moved, math.pi * cfg.radius * cfg.radius * cfg.height)
@@ -163,6 +176,26 @@ class Full3DOptimizerTest(unittest.TestCase):
         self.assertGreater(float(np.max(cap_delta)), 1.0e-8)
         self.assertLessEqual(_electrode_error_for_test(cfg, moved), cfg.full3d_electrode_tolerance_m)
 
+    def test_global_initial_shape_action_is_not_local_cylinder_perturbation(self) -> None:
+        cfg = self._small_cfg()
+        target = math.pi * cfg.radius * cfg.radius * cfg.height
+        baseline = project_full3d_geometry(cfg, build_baseline_full3d_geometry(cfg), target)
+        action = np.zeros(full3d_action_dim(cfg), dtype=np.float64)
+        circum_terms = 1 + 2 * cfg.full3d_action_circum_modes
+        side_channel_dim = cfg.full3d_action_axial_modes * circum_terms
+        action[0 * side_channel_dim + 1 * circum_terms] = 2.0
+        action[2 * side_channel_dim + 0 * circum_terms] = 1.3
+        if circum_terms > 2:
+            action[3 * side_channel_dim + 2] = -1.2
+        geom = build_full3d_initial_shape_from_action(cfg, action, target_volume=target)
+        self.assertLess(abs(mesh_volume(geom) - target) / target, 1.0e-5)
+        side_ids = baseline.side_indices.reshape(-1)
+        delta = np.linalg.norm(geom.vertices[side_ids, :2] - baseline.vertices[side_ids, :2], axis=1)
+        self.assertGreater(float(np.max(delta)), 2.0e-4)
+        metrics = evaluate_full3d_geometry(cfg, geom, evaluate_full3d_geometry(cfg, baseline))
+        self.assertIn("energy_conversion_efficiency_0_3um", metrics)
+        self.assertLessEqual(metrics["voltage_v"], cfg.max_voltage)
+
     def test_full3d_optimizer_smoke(self) -> None:
         cfg = self._small_cfg()
         result = run_full3d_optimization(cfg, generations=1, population_size=2, seed=3)
@@ -173,6 +206,8 @@ class Full3DOptimizerTest(unittest.TestCase):
         self.assertEqual(result.selection_diagnostics["voltage_search_mode"], "rated_search")
         self.assertEqual(result.selection_diagnostics["action_dim_full3d"], full3d_action_dim(cfg))
         self.assertIn("action_space_full3d", result.selection_diagnostics)
+        self.assertIn("optimization_target_full3d", result.selection_diagnostics)
+        self.assertIn("energy_conversion_efficiency_0_3um", result.best_metrics)
         self.assertLessEqual(result.best_metrics["volume_change_ratio_3d"], 5.0e-5)
         self.assertTrue(result.best_metrics["top_bottom_faces_variable"])
 

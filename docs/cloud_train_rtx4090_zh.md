@@ -14,11 +14,16 @@
 - 电压只加在钨棒两端，铜电极电压降为 0。
 - 只有侧面自由表面参与向 `300K` 环境的净辐射/散热和升华；所有端面都不计向外辐射和升华。
 - 超出电极盘的端面不辐射、不升华、不导热；原电极盘内但钨端面不再覆盖的区域会减少接触导热面积。
-- 优化目标统计能到达外接吸收面的 `0-3um` 净辐射；热平衡散热边界和目标辐射统计是两个不同字段。
+- 辐射诊断仍统计能到达外接吸收面的 `0-3um` 净辐射；热平衡散热边界、escaped 辐射统计和 energy-conversion efficiency 是不同字段。
 - `100V` 是系统允许的额定搜索上限，不是固定工作电压。
 - 默认从 `V <= 100V` 中搜索综合辐射收益和蒸发/寿命后的最优稳态；初始 5mm x 15mm 圆柱额定电压约 `0.34V`。
 - `--fixed-voltage <V>` 只用于诊断固定电压是否过温，不用于正式优化。
-- 动作空间为低阶 full3d 拓扑动作：侧壁 `Chebyshev(z) x Fourier(theta)` 径向位移，加顶/底面 `Chebyshev(radius) x Fourier(theta)` 轴向位移；CEM 根据精英候选更新动作分布。
+- 正式评分主目标是额定工况下 `0-3um` escaped energy-conversion efficiency，并约束 `lifetime>=30% baseline`、`T<=3000C` 和同体积。
+- `5mm x 15mm` 圆柱只作为体积和寿命 baseline，不再假设为最优初始形状。
+- 动作空间是 Phy-DRL-LSM inspired global initial-shape strategy-field：每个 action 生成完整通电前几何。
+- strategy channels 默认为 4 类：`radiation`、`evaporation`、`current`、`direct`。
+- 侧壁 strategy maps 与物理敏度组合为法向速度，再做 Lagrange 体积保持投影；顶/底端面 footprint 使用平面内模式。
+- CEM 根据额定工况下的 energy-conversion efficiency 和可行性约束选择精英候选并更新动作分布。
 
 ## 2. 环境准备
 
@@ -58,6 +63,8 @@ python -u optimize_3d.py \
   --generations 4 \
   --population-size 16 \
   --thermal-iters 640 \
+  --action-strategy-channels 4 \
+  --global-shape-steps 4 \
   --no-step \
   2>&1 | tee -a logs/full3d_$(date +%F_%H%M%S).log
 ```
@@ -83,7 +90,7 @@ outputs/three_d_runs/<experiment>_<stamp>/
 tmux new -s mcga_full3d
 conda activate mcga_4090
 cd ~/work/make_cylinder_great_again
-python -u optimize_3d.py --experiment-name mcga_full3d_4090 --output-dir outputs/three_d_runs --generations 4 --population-size 16 --thermal-iters 640 --no-step
+python -u optimize_3d.py --experiment-name mcga_full3d_4090 --output-dir outputs/three_d_runs --generations 4 --population-size 16 --thermal-iters 640 --action-strategy-channels 4 --global-shape-steps 4 --no-step
 ```
 
 断开会话：`Ctrl+b` 后按 `d`。恢复会话：
@@ -100,6 +107,7 @@ import json, pathlib
 root = sorted(pathlib.Path("outputs/three_d_runs").glob("mcga_full3d_4090_*"))[-1]
 s = json.loads((root / "run_summary_full3d.json").read_text())
 for k in [
+    "optimization_target_full3d",
     "baseline_voltage_v",
     "final_voltage_v",
     "tungsten_voltage_v",
@@ -111,8 +119,11 @@ for k in [
     "missing_electrode_contact_area_m2",
     "action_dim_full3d",
     "action_space_full3d",
+    "strategy_channels_full3d",
+    "global_shape_steps_full3d",
     "thermal_converged",
-    "power_ratio_full3d",
+    "final_energy_conversion_efficiency_0_3um",
+    "energy_conversion_efficiency_ratio",
     "lifetime_ratio_full3d",
     "archive_feasible_count",
     "selection_reason_full3d",
@@ -125,11 +136,15 @@ PY
 
 - `voltage_search_mode = rated_search`，且 `final_voltage_v <= 100`。
 - `baseline_voltage_v` 对初始圆柱应接近 `0.34V`。
+- `optimization_target_full3d` 应说明主目标是 rated-condition `0-3um` escaped energy-conversion efficiency。
+- `final_energy_conversion_efficiency_0_3um` 是正式主目标字段；`energy_conversion_efficiency_ratio` 用于和初始圆柱 baseline 对比。
 - `lifetime_ratio_full3d >= 0.30`。
 - `archive_feasible_count > 0`。
 - `electrode_voltage_drop_v = 0`，`electrode_boundary_temperature_k = 300`。
 - `electrode_contact_area_m2`、`noncontact_end_face_area_m2`、`missing_electrode_contact_area_m2` 存在，用于检查端面 footprint 与电极盘的实际接触关系。
-- `action_dim_full3d` 和 `action_space_full3d` 存在，说明运行的是显式 full3d 拓扑动作空间。
+- `strategy_channels_full3d = 4` 时对应 `radiation/evaporation/current/direct` 四类 strategy maps。
+- `global_shape_steps_full3d` 存在，说明运行的是全局初始形状策略场推进，而不是圆柱附近局部形变。
+- `action_dim_full3d` 和 `action_space_full3d` 存在，说明运行的是显式 full3d 全局策略场拓扑动作空间。
 
 ## 7. 产物回收
 

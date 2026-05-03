@@ -80,8 +80,14 @@ class CylinderPhysicsCfg:
     full3d_action_axial_modes = 5
     full3d_action_circum_modes = 3
     full3d_action_cap_radial_modes = 4
+    full3d_action_strategy_channels = 4
+    full3d_global_shape_steps = 4
+    full3d_global_step_m = 6.0e-4
+    full3d_global_step_decay = 0.96
+    full3d_global_max_radius_m = 5.0e-3
+    full3d_neural_policy_amplitude_m = 7.5e-5
     full3d_cem_elite_fraction = 0.35
-    full3d_cem_initial_sigma = 0.85
+    full3d_cem_initial_sigma = 1.10
     full3d_cem_min_sigma = 0.05
     full3d_cem_smoothing = 0.55
 

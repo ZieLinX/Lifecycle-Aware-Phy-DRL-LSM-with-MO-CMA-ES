@@ -33,6 +33,14 @@ def _configure_cfg(args):
         cfg.full3d_action_circum_modes = int(args.action_circum_modes)
     if args.action_cap_radial_modes is not None:
         cfg.full3d_action_cap_radial_modes = int(args.action_cap_radial_modes)
+    if args.action_strategy_channels is not None:
+        cfg.full3d_action_strategy_channels = int(args.action_strategy_channels)
+    if args.global_shape_steps is not None:
+        cfg.full3d_global_shape_steps = int(args.global_shape_steps)
+    if args.global_step_m is not None:
+        cfg.full3d_global_step_m = float(args.global_step_m)
+    if args.global_max_radius_m is not None:
+        cfg.full3d_global_max_radius_m = float(args.global_max_radius_m)
     if args.cem_initial_sigma is not None:
         cfg.full3d_cem_initial_sigma = float(args.cem_initial_sigma)
     if args.cem_elite_fraction is not None:
@@ -52,7 +60,7 @@ def _build_summary(args, cfg, result, export_info, anim_info) -> dict[str, objec
     base_power = max(float(result.baseline_metrics.get("net_radiated_power_0k_sphere_w", 0.0)), 1.0e-9)
     final_power = float(result.best_metrics.get("net_radiated_power_0k_sphere_w", 0.0))
     return {
-        "method": "full3d_unet_gnn_policy_closed_mesh_300k_sink",
+        "method": "full3d_phydrl_lsm_cem_global_initial_shape_300k_sink",
         "backend": "full3d",
         "device": args.device,
         "candidate_count": int(result.candidate_count),
@@ -62,12 +70,17 @@ def _build_summary(args, cfg, result, export_info, anim_info) -> dict[str, objec
         "top_bottom_faces_variable": True,
         "electrode_constraint": "two 5 mm circular electrode disks remain fixed; tungsten end-face footprint may change and only overlap area contacts the electrodes",
         "volume_constraint": "pre-energization closed-mesh volume is projected to the initial cylinder volume",
+        "baseline_initial_shape": "specified 5 mm diameter x 15 mm pure tungsten cylinder; used as volume/lifetime reference, not assumed optimal",
+        "optimized_initial_shape": "selected global pre-energization topology candidate with same material volume as the specified cylinder",
         "thermal_boundary": "300 K electrode conduction through actual contact area plus 300 K free-surface radiative sink; all end-face area is excluded from radiation and sublimation",
         "external_sphere": "optical target is escaped 0-3 um free-surface radiation to a 0 K absorbing sphere; thermal balance uses 300 K free-surface radiation",
         "policy_model": "lightweight 3D U-Net encoder with graph-neighborhood smoothing head",
-        "optimizer": "CEM over explicit low-order full3d topology actions, optionally seeded by the U-Net/GNN structured perturbation",
+        "optimizer": "CEM over Phy-DRL-LSM inspired global initial-shape strategy-field actions; optional U-Net/GNN perturbations act on generated candidates",
+        "optimization_target_full3d": str(result.selection_diagnostics.get("optimization_target_full3d", "")),
         "action_space_full3d": str(result.selection_diagnostics.get("action_space_full3d", "")),
         "action_dim_full3d": int(result.selection_diagnostics.get("action_dim_full3d", 0)),
+        "strategy_channels_full3d": int(result.selection_diagnostics.get("strategy_channels_full3d", 0)),
+        "global_shape_steps_full3d": int(result.selection_diagnostics.get("global_shape_steps_full3d", 0)),
         "cem_elite_fraction_full3d": float(result.selection_diagnostics.get("cem_elite_fraction_full3d", 0.0)),
         "voltage_search_mode": str(result.best_metrics.get("voltage_search_mode", result.selection_diagnostics.get("voltage_search_mode", ""))),
         "voltage_constraint": (
@@ -83,6 +96,10 @@ def _build_summary(args, cfg, result, export_info, anim_info) -> dict[str, objec
         "baseline_net_radiated_power_0k_sphere_w": base_power,
         "final_net_radiated_power_0k_sphere_w": final_power,
         "final_net_radiated_power_300k_environment_w": float(result.best_metrics.get("net_radiated_power_300k_environment_w", final_power)),
+        "baseline_energy_conversion_efficiency_0_3um": float(result.baseline_metrics.get("energy_conversion_efficiency_0_3um", 0.0)),
+        "final_energy_conversion_efficiency_0_3um": float(result.best_metrics.get("energy_conversion_efficiency_0_3um", 0.0)),
+        "energy_conversion_efficiency_ratio": float(result.best_metrics.get("energy_conversion_efficiency_ratio", 0.0)),
+        "radiation_efficiency_score": float(result.best_metrics.get("radiation_efficiency_score", 0.0)),
         "thermal_radiation_sink_temperature_k": float(result.best_metrics.get("thermal_radiation_sink_temperature_k", cfg.ambient_temp)),
         "electrode_boundary_temperature_k": float(result.best_metrics.get("electrode_boundary_temperature_k", cfg.ambient_temp)),
         "tungsten_voltage_v": float(result.best_metrics.get("tungsten_voltage_v", result.best_metrics.get("voltage_v", 0.0))),
@@ -134,6 +151,10 @@ def main() -> None:
     parser.add_argument("--action-axial-modes", type=int, default=None)
     parser.add_argument("--action-circum-modes", type=int, default=None)
     parser.add_argument("--action-cap-radial-modes", type=int, default=None)
+    parser.add_argument("--action-strategy-channels", type=int, default=None)
+    parser.add_argument("--global-shape-steps", type=int, default=None)
+    parser.add_argument("--global-step-m", type=float, default=None)
+    parser.add_argument("--global-max-radius-m", type=float, default=None)
     parser.add_argument("--cem-initial-sigma", type=float, default=None)
     parser.add_argument("--cem-elite-fraction", type=float, default=None)
     parser.add_argument("--seed", type=int, default=42)
