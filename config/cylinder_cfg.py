@@ -68,6 +68,7 @@ class CylinderPhysicsCfg:
     full3d_electrode_tolerance_m = 2.0e-6
     full3d_fixed_voltage_v = None
     full3d_thermal_sink_temperature_k = 300.0
+    full3d_electrode_contact_length_m = 2.0e-4
     full3d_thermal_residual_tol_w = 1.0e-3
     full3d_thermal_max_delta_k = 1200.0
     full3d_lifecycle_reference_s = 1.0e27

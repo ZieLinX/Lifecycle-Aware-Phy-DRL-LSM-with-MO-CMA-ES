@@ -5,12 +5,15 @@
 ## 1. full3d 口径
 
 - 几何是封闭三维 mesh；侧面、顶面、底面都可以变化。
-- 两端 5mm 圆形电极边界保持直径和相对位置不变。
+- 两端 5mm 圆形电极盘保持直径和相对位置不变；钨棒端面 footprint 可以改变，不强制为 5mm 圆。
+- 钨棒横向长度/两端平面距离始终保持 `15mm`。
 - 通电前材料体积投影回初始圆柱体积。
-- 钨棒内部显式计算轴向导热；两端铜电极为 `300K` 固定温度边界。
+- 钨棒内部显式计算轴向导热；两端铜电极盘为 `300K`。
+- 电极导热按钨端面 footprint 与固定 5mm 电极盘的实际重叠面积计算。
 - 忽略钨棒和铜电极之间的接触热阻、接触电阻。
 - 电压只加在钨棒两端，铜电极电压降为 0。
-- 只有自由表面参与向 `300K` 环境的净辐射/散热和升华；接触电极的端面不计辐射和升华。
+- 只有侧面自由表面参与向 `300K` 环境的净辐射/散热和升华；所有端面都不计向外辐射和升华。
+- 超出电极盘的端面不辐射、不升华、不导热；原电极盘内但钨端面不再覆盖的区域会减少接触导热面积。
 - 优化目标统计能到达外接吸收面的 `0-3um` 净辐射；热平衡散热边界和目标辐射统计是两个不同字段。
 - `100V` 是系统允许的额定搜索上限，不是固定工作电压。
 - 默认从 `V <= 100V` 中搜索综合辐射收益和蒸发/寿命后的最优稳态；初始 5mm x 15mm 圆柱额定电压约 `0.34V`。
@@ -103,6 +106,9 @@ for k in [
     "electrode_voltage_drop_v",
     "thermal_radiation_sink_temperature_k",
     "electrode_boundary_temperature_k",
+    "electrode_contact_area_m2",
+    "noncontact_end_face_area_m2",
+    "missing_electrode_contact_area_m2",
     "action_dim_full3d",
     "action_space_full3d",
     "thermal_converged",
@@ -122,6 +128,7 @@ PY
 - `lifetime_ratio_full3d >= 0.30`。
 - `archive_feasible_count > 0`。
 - `electrode_voltage_drop_v = 0`，`electrode_boundary_temperature_k = 300`。
+- `electrode_contact_area_m2`、`noncontact_end_face_area_m2`、`missing_electrode_contact_area_m2` 存在，用于检查端面 footprint 与电极盘的实际接触关系。
 - `action_dim_full3d` 和 `action_space_full3d` 存在，说明运行的是显式 full3d 拓扑动作空间。
 
 ## 7. 产物回收

@@ -141,7 +141,9 @@ def build_baseline_full3d_geometry(cfg) -> Full3DGeometry:
         for sidx, angle in enumerate(theta):
             side_idx[ridx, sidx] = add_vertex(radius * math.cos(angle), radius * math.sin(angle), z)
 
-    # cap ring 0 is the fixed 5 mm electrode boundary and reuses the side end ring.
+    # cap ring 0 is the tungsten end-face outer boundary and reuses the side end ring.
+    # It is not fixed to the 5 mm electrode disk; contact is computed as the
+    # footprint overlap with the fixed electrode disk.
     lower_idx[0, :] = side_idx[0, :]
     upper_idx[0, :] = side_idx[-1, :]
     for k in range(1, cap_rings):
@@ -221,32 +223,87 @@ def _mesh_area_normals_centers(geometry: Full3DGeometry) -> tuple[np.ndarray, np
 
 
 def _free_vertex_mask(geometry: Full3DGeometry) -> np.ndarray:
-    mask = np.ones(geometry.vertices.shape[0], dtype=bool)
-    mask[geometry.lower_electrode_indices] = False
-    mask[geometry.upper_electrode_indices] = False
-    return mask
+    return np.ones(geometry.vertices.shape[0], dtype=bool)
 
 
 def _electrode_error(geometry: Full3DGeometry, cfg) -> float:
-    radius = float(cfg.radius)
     height = float(cfg.height)
-    ids = np.concatenate([geometry.lower_electrode_indices, geometry.upper_electrode_indices])
+    ids = np.unique(
+        np.concatenate(
+            [
+                geometry.side_indices[0].reshape(-1),
+                geometry.side_indices[-1].reshape(-1),
+                geometry.lower_cap_indices.reshape(-1),
+                geometry.upper_cap_indices.reshape(-1),
+            ]
+        )
+    )
+    ids = ids[ids >= 0]
     points = geometry.vertices[ids]
-    radial = np.linalg.norm(points[:, :2], axis=1)
-    target_z = np.concatenate([
-        np.full(len(geometry.lower_electrode_indices), -0.5 * height),
-        np.full(len(geometry.upper_electrode_indices), 0.5 * height),
-    ])
-    return float(max(np.max(np.abs(radial - radius)), np.max(np.abs(points[:, 2] - target_z))))
+    lower = points[:, 2] < 0.0
+    lower_error = np.max(np.abs(points[lower, 2] + 0.5 * height)) if np.any(lower) else 0.0
+    upper_error = np.max(np.abs(points[~lower, 2] - 0.5 * height)) if np.any(~lower) else 0.0
+    return float(max(lower_error, upper_error))
+
+
+def _enforce_axial_length(cfg, geometry: Full3DGeometry, vertices: np.ndarray) -> None:
+    height = float(cfg.height)
+    z_values = np.linspace(-0.5 * height, 0.5 * height, int(geometry.num_rings), dtype=np.float64)
+    for ridx, z in enumerate(z_values):
+        ids = geometry.side_indices[ridx]
+        ids = ids[ids >= 0]
+        vertices[ids, 2] = float(z)
+    lower_ids = geometry.lower_cap_indices.reshape(-1)
+    lower_ids = lower_ids[lower_ids >= 0]
+    upper_ids = geometry.upper_cap_indices.reshape(-1)
+    upper_ids = upper_ids[upper_ids >= 0]
+    vertices[lower_ids, 2] = -0.5 * height
+    vertices[upper_ids, 2] = 0.5 * height
+
+
+def _end_contact_metrics(geometry: Full3DGeometry, cfg) -> Dict[str, float]:
+    electrode_radius = float(cfg.radius)
+    electrode_area = math.pi * electrode_radius * electrode_radius
+
+    def one_end(ids: np.ndarray) -> tuple[float, float, float, float]:
+        points = geometry.vertices[ids]
+        footprint_area = _polygon_area_xy(points[:, :2])
+        radial = np.linalg.norm(points[:, :2], axis=1)
+        scale = np.minimum(1.0, electrode_radius / np.maximum(radial, 1.0e-12))
+        clipped = points[:, :2] * scale[:, None]
+        contact_area = min(_polygon_area_xy(clipped), footprint_area, electrode_area)
+        noncontact = max(footprint_area - contact_area, 0.0)
+        missing = max(electrode_area - contact_area, 0.0)
+        return float(footprint_area), float(contact_area), float(noncontact), float(missing)
+
+    lower_footprint, lower_contact, lower_noncontact, lower_missing = one_end(geometry.lower_electrode_indices)
+    upper_footprint, upper_contact, upper_noncontact, upper_missing = one_end(geometry.upper_electrode_indices)
+    total_footprint = lower_footprint + upper_footprint
+    total_contact = lower_contact + upper_contact
+    return {
+        "electrode_disk_area_m2": float(electrode_area),
+        "lower_end_face_area_m2": lower_footprint,
+        "upper_end_face_area_m2": upper_footprint,
+        "end_face_area_m2": float(total_footprint),
+        "lower_electrode_contact_area_m2": lower_contact,
+        "upper_electrode_contact_area_m2": upper_contact,
+        "electrode_contact_area_m2": float(total_contact),
+        "lower_noncontact_end_face_area_m2": lower_noncontact,
+        "upper_noncontact_end_face_area_m2": upper_noncontact,
+        "noncontact_end_face_area_m2": float(lower_noncontact + upper_noncontact),
+        "lower_missing_electrode_area_m2": lower_missing,
+        "upper_missing_electrode_area_m2": upper_missing,
+        "missing_electrode_contact_area_m2": float(lower_missing + upper_missing),
+        "lower_contact_fraction_of_tungsten_end": float(lower_contact / max(lower_footprint, 1.0e-18)),
+        "upper_contact_fraction_of_tungsten_end": float(upper_contact / max(upper_footprint, 1.0e-18)),
+    }
 
 
 def project_full3d_geometry(cfg, geometry: Full3DGeometry, target_volume: float) -> Full3DGeometry:
     vertices = geometry.vertices.copy()
     baseline = build_baseline_full3d_geometry(cfg)
     free = _free_vertex_mask(geometry)
-    fixed = ~free
-    vertices[fixed] = baseline.vertices[fixed]
-    center = np.zeros(3, dtype=np.float64)
+    _enforce_axial_length(cfg, geometry, vertices)
     max_delta = float(getattr(cfg, "feature_fail_ratio", 0.20)) * float(cfg.radius)
     delta = vertices[free] - baseline.vertices[free]
     delta_norm = np.linalg.norm(delta, axis=1)
@@ -254,12 +311,13 @@ def project_full3d_geometry(cfg, geometry: Full3DGeometry, target_volume: float)
     if np.any(too_far):
         delta[too_far] *= (max_delta / np.maximum(delta_norm[too_far], 1.0e-12))[:, None]
         vertices[free] = baseline.vertices[free] + delta
+    _enforce_axial_length(cfg, geometry, vertices)
     for _ in range(6):
         trial = _clone_geometry(geometry, vertices)
         current_volume = mesh_volume(trial)
-        scale = (float(target_volume) / max(current_volume, 1.0e-18)) ** (1.0 / 3.0)
-        vertices[free] = center + (vertices[free] - center) * scale
-        vertices[fixed] = baseline.vertices[fixed]
+        scale = math.sqrt(float(target_volume) / max(current_volume, 1.0e-18))
+        vertices[free, :2] *= scale
+        _enforce_axial_length(cfg, geometry, vertices)
     return _clone_geometry(geometry, vertices)
 
 
@@ -403,9 +461,8 @@ def _apply_full3d_topology_action(
 
     The action is a compact set of spectral coefficients:
     side-wall radial displacement over Chebyshev(z) x Fourier(theta), plus
-    independent lower/upper cap axial displacement over Chebyshev(radius) x
-    Fourier(theta). Electrode boundary vertices remain fixed by construction
-    and are reset again during projection.
+    independent lower/upper cap in-plane displacement over Chebyshev(radius) x
+    Fourier(theta). Axial end planes are kept 15 mm apart during projection.
     """
 
     layout = _full3d_action_layout(cfg)
@@ -431,7 +488,7 @@ def _apply_full3d_topology_action(
     z_norm = 2.0 * (z - np.min(z)) / max(float(np.max(z) - np.min(z)), 1.0e-12) - 1.0
     axial_basis = _chebyshev_basis(z_norm, axial_modes)
     circum = _circum_basis(geometry.num_segments, circum_modes)
-    axial_fade = np.sin(math.pi * np.clip((z_norm + 1.0) * 0.5, 0.0, 1.0))
+    axial_fade = 0.35 + 0.65 * np.sin(math.pi * np.clip((z_norm + 1.0) * 0.5, 0.0, 1.0))
     side_field = _basis_field(axial_basis, side_coeff, circum) * axial_fade[:, None]
     side_ids = geometry.side_indices.reshape(-1)
     side_disp = side_field.reshape(-1)
@@ -456,7 +513,12 @@ def _apply_full3d_topology_action(
         cap_disp = float(amplitude) * 0.85 * cap_field.reshape(-1)
         cap_valid = (cap_ids >= 0) & free[np.maximum(cap_ids, 0)]
         if np.any(cap_valid):
-            _apply_indexed_displacement(vertices, cap_ids[cap_valid], cap_disp[cap_valid], axis=2)
+            target_ids = cap_ids[cap_valid]
+            target_disp = cap_disp[cap_valid]
+            radial = vertices[target_ids, :2]
+            radial_norm = np.linalg.norm(radial, axis=1, keepdims=True)
+            radial_dir = radial / np.maximum(radial_norm, 1.0e-12)
+            vertices[target_ids, :2] += target_disp[:, None] * radial_dir
 
     return _clone_geometry(geometry, vertices)
 
@@ -635,12 +697,20 @@ def _solve_full3d_thermal_state(
     electrode_temp = float(cfg.ambient_temp)
     z, cross_area = _full3d_axial_profile(geometry)
     free_area, effective_area, side_total_area = _side_surface_lumped_by_ring(geometry, area, normals, centers)
+    contact_metrics = _end_contact_metrics(geometry, cfg)
     order = np.argsort(z)
     inv_order = np.argsort(order)
     z_s = z[order]
     area_s = cross_area[order]
     free_s = free_area[order]
     effective_s = effective_area[order]
+    lower_contact = float(contact_metrics["lower_electrode_contact_area_m2"])
+    upper_contact = float(contact_metrics["upper_electrode_contact_area_m2"])
+    contact_s = np.zeros_like(area_s)
+    lower_sorted_idx = int(np.argmin(z_s))
+    upper_sorted_idx = int(np.argmax(z_s))
+    contact_s[lower_sorted_idx] = lower_contact
+    contact_s[upper_sorted_idx] = upper_contact
     dz = np.maximum(np.diff(z_s), 1.0e-8)
     if len(z_s) < 2:
         resistance = max(float(cfg.rho_elec_ref) * float(cfg.height) / max(math.pi * float(cfg.radius) ** 2, 1.0e-12), float(cfg.min_resistance))
@@ -661,6 +731,8 @@ def _solve_full3d_thermal_state(
             "escape_view_factor_proxy": 0.0,
             "axial_resistance_shape_factor_m_inv": float(cfg.height) / max(math.pi * float(cfg.radius) ** 2, 1.0e-12),
             "electrode_conducted_power_w": float(voltage * current),
+            "electrode_contact_area_m2": float(contact_metrics["electrode_contact_area_m2"]),
+            "noncontact_end_face_area_m2": float(contact_metrics["noncontact_end_face_area_m2"]),
         }
 
     temperature = np.full(len(z_s), electrode_temp, dtype=np.float64)
@@ -674,8 +746,6 @@ def _solve_full3d_thermal_state(
     thermal_converged = False
 
     for _ in range(int(cfg.thermal_max_iters)):
-        temperature[0] = electrode_temp
-        temperature[-1] = electrode_temp
         _, rho_nodes = _material_properties_np(cfg, temperature)
         rho_seg = 0.5 * (rho_nodes[:-1] + rho_nodes[1:])
         area_seg = np.maximum(0.5 * (area_s[:-1] + area_s[1:]), 1.0e-12)
@@ -690,55 +760,58 @@ def _solve_full3d_thermal_state(
         k_nodes, _ = _material_properties_np(cfg, temperature)
         k_seg = 0.5 * (k_nodes[:-1] + k_nodes[1:])
         conductance = k_seg * area_seg / dz
+        contact_length = max(float(getattr(cfg, "full3d_electrode_contact_length_m", 2.0e-4)), 1.0e-8)
+        contact_conductance = k_nodes * contact_s / contact_length
         radiation = _radiative_loss_by_node(cfg, temperature, free_s)
         evaporation = _evaporative_loss_by_node(cfg, temperature, free_s)
         rad_slope = _radiative_loss_slope_by_node(cfg, temperature, free_s)
         evap_slope = _evaporative_loss_slope_by_node(cfg, temperature, free_s)
 
         residual = np.zeros_like(temperature)
+        residual[0] += conductance[0] * (temperature[1] - temperature[0])
+        residual[-1] += conductance[-1] * (temperature[-2] - temperature[-1])
         residual[1:-1] += conductance[:-1] * (temperature[:-2] - temperature[1:-1])
         residual[1:-1] += conductance[1:] * (temperature[2:] - temperature[1:-1])
-        residual[1:-1] += joule_node[1:-1] - radiation[1:-1] - evaporation[1:-1]
-        thermal_residual = float(np.max(np.abs(residual[1:-1]))) if len(temperature) > 2 else 0.0
+        residual += joule_node - radiation - evaporation + contact_conductance * (electrode_temp - temperature)
+        thermal_residual = float(np.max(np.abs(residual))) if len(temperature) > 0 else 0.0
 
-        interior = len(temperature) - 2
-        if interior <= 0:
-            thermal_converged = True
-            break
-        matrix = np.zeros((interior, interior), dtype=np.float64)
-        rhs = np.zeros(interior, dtype=np.float64)
-        for ridx in range(1, len(temperature) - 1):
-            row = ridx - 1
-            left = float(conductance[ridx - 1])
-            right = float(conductance[ridx])
+        node_count = len(temperature)
+        matrix = np.zeros((node_count, node_count), dtype=np.float64)
+        rhs = np.zeros(node_count, dtype=np.float64)
+        for ridx in range(node_count):
+            left = float(conductance[ridx - 1]) if ridx > 0 else 0.0
+            right = float(conductance[ridx]) if ridx < node_count - 1 else 0.0
             sink_slope = float(rad_slope[ridx] + evap_slope[ridx])
-            matrix[row, row] = left + right + sink_slope
-            if row > 0:
-                matrix[row, row - 1] = -left
-            else:
-                rhs[row] += left * electrode_temp
-            if row < interior - 1:
-                matrix[row, row + 1] = -right
-            else:
-                rhs[row] += right * electrode_temp
-            rhs[row] += float(joule_node[ridx] - radiation[ridx] - evaporation[ridx] + sink_slope * temperature[ridx])
+            contact = float(contact_conductance[ridx])
+            matrix[ridx, ridx] = left + right + sink_slope + contact
+            if ridx > 0:
+                matrix[ridx, ridx - 1] = -left
+            if ridx < node_count - 1:
+                matrix[ridx, ridx + 1] = -right
+            rhs[ridx] += float(
+                joule_node[ridx]
+                - radiation[ridx]
+                - evaporation[ridx]
+                + sink_slope * temperature[ridx]
+                + contact * electrode_temp
+            )
         try:
             solved = np.linalg.solve(matrix, rhs)
         except np.linalg.LinAlgError:
-            solved = temperature[1:-1] + residual[1:-1] / np.maximum(
-                conductance[:-1] + conductance[1:] + rad_slope[1:-1] + evap_slope[1:-1],
+            diag = np.zeros_like(temperature)
+            diag += rad_slope + evap_slope + contact_conductance
+            diag[:-1] += conductance
+            diag[1:] += conductance
+            solved = temperature + residual / np.maximum(
+                diag,
                 1.0e-9,
             )
         updated = temperature.copy()
-        updated[1:-1] = solved
-        updated[0] = electrode_temp
-        updated[-1] = electrode_temp
+        updated[:] = solved
         updated = np.maximum(updated, electrode_temp)
         delta_limit = float(getattr(cfg, "full3d_thermal_max_delta_k", 1200.0))
         step = np.clip(updated - temperature, -delta_limit, delta_limit)
         updated = temperature + float(cfg.thermal_relaxation) * step
-        updated[0] = electrode_temp
-        updated[-1] = electrode_temp
         updated = np.maximum(updated, electrode_temp)
         max_delta_observed = float(np.max(np.abs(updated - temperature)))
         temperature = updated
@@ -757,15 +830,21 @@ def _solve_full3d_thermal_state(
     evaporative_by_node = _evaporative_loss_by_node(cfg, temperature, free_s)
     full_radiative_power = float(np.sum(full_radiative_by_node))
     evaporative_power = float(np.sum(evaporative_by_node))
+    k_nodes, _ = _material_properties_np(cfg, temperature)
+    contact_length = max(float(getattr(cfg, "full3d_electrode_contact_length_m", 2.0e-4)), 1.0e-8)
+    contact_conductance = k_nodes * contact_s / contact_length
     residual = np.zeros_like(temperature)
+    residual[0] += conductance[0] * (temperature[1] - temperature[0])
+    residual[-1] += conductance[-1] * (temperature[-2] - temperature[-1])
     residual[1:-1] += conductance[:-1] * (temperature[:-2] - temperature[1:-1])
     residual[1:-1] += conductance[1:] * (temperature[2:] - temperature[1:-1])
     joule_seg = current * current * segment_resistance
     joule_node = np.zeros_like(temperature)
     joule_node[:-1] += 0.5 * joule_seg
     joule_node[1:] += 0.5 * joule_seg
-    residual[1:-1] += joule_node[1:-1] - full_radiative_by_node[1:-1] - evaporative_by_node[1:-1]
-    thermal_residual = float(np.max(np.abs(residual[1:-1]))) if len(temperature) > 2 else 0.0
+    residual += joule_node - full_radiative_by_node - evaporative_by_node + contact_conductance * (electrode_temp - temperature)
+    electrode_conducted = float(np.sum(contact_conductance * np.maximum(temperature - electrode_temp, 0.0)))
+    thermal_residual = float(np.max(np.abs(residual))) if len(temperature) > 0 else 0.0
     thermal_converged = bool(
         thermal_converged
         or (
@@ -790,7 +869,12 @@ def _solve_full3d_thermal_state(
         "effective_radiating_area_m2": float(np.sum(effective_s)),
         "escape_view_factor_proxy": float(np.sum(effective_s) / max(float(side_total_area), 1.0e-12)),
         "axial_resistance_shape_factor_m_inv": float(np.sum(dz / area_seg)),
-        "electrode_conducted_power_w": float(max(electrical_power - full_radiative_power - evaporative_power, 0.0)),
+        "electrode_conducted_power_w": electrode_conducted,
+        "electrode_contact_area_m2": float(contact_metrics["electrode_contact_area_m2"]),
+        "lower_electrode_contact_area_m2": lower_contact,
+        "upper_electrode_contact_area_m2": upper_contact,
+        "noncontact_end_face_area_m2": float(contact_metrics["noncontact_end_face_area_m2"]),
+        "missing_electrode_contact_area_m2": float(contact_metrics["missing_electrode_contact_area_m2"]),
     }
 
 
@@ -837,6 +921,7 @@ def _evaluate_full3d_geometry_at_voltage(
     voltage = float(voltage)
     surface_area = float(np.sum(area))
     cylinder_area = 2.0 * math.pi * float(cfg.radius) * float(cfg.height) + 2.0 * math.pi * float(cfg.radius) ** 2
+    contact_metrics = _end_contact_metrics(geometry, cfg)
     thermal = _solve_full3d_thermal_state(cfg, voltage, geometry, area, normals, centers)
     temperature_profile = np.asarray(thermal["temperature_profile_k"], dtype=np.float64)
     max_temperature = float(thermal["max_temperature_k"])
@@ -942,7 +1027,16 @@ def _evaluate_full3d_geometry_at_voltage(
         "surface_area_ratio": float(surface_area / max(cylinder_area, 1.0e-12)),
         "free_radiating_surface_area_m2": float(side_area),
         "free_surface_thermal_balance_area_m2": float(side_area),
-        "contact_end_face_area_m2": float(surface_area - side_area),
+        "contact_end_face_area_m2": float(contact_metrics["electrode_contact_area_m2"]),
+        "end_face_area_m2": float(contact_metrics["end_face_area_m2"]),
+        "electrode_disk_area_m2": float(contact_metrics["electrode_disk_area_m2"]),
+        "electrode_contact_area_m2": float(contact_metrics["electrode_contact_area_m2"]),
+        "lower_electrode_contact_area_m2": float(contact_metrics["lower_electrode_contact_area_m2"]),
+        "upper_electrode_contact_area_m2": float(contact_metrics["upper_electrode_contact_area_m2"]),
+        "noncontact_end_face_area_m2": float(contact_metrics["noncontact_end_face_area_m2"]),
+        "missing_electrode_contact_area_m2": float(contact_metrics["missing_electrode_contact_area_m2"]),
+        "lower_contact_fraction_of_tungsten_end": float(contact_metrics["lower_contact_fraction_of_tungsten_end"]),
+        "upper_contact_fraction_of_tungsten_end": float(contact_metrics["upper_contact_fraction_of_tungsten_end"]),
         "axial_resistance_shape_factor_m_inv": float(thermal["axial_resistance_shape_factor_m_inv"]),
         "escape_view_factor_proxy": float(thermal["escape_view_factor_proxy"]),
         "blackbody_band_fraction_0_3um": float(np.average(band_fraction_by_ring, weights=np.maximum(effective_area_by_ring, 1.0e-18))),
@@ -956,6 +1050,7 @@ def _evaluate_full3d_geometry_at_voltage(
         "constraint_feasible_3d": bool(feasible),
         "top_bottom_faces_variable": True,
         "electrode_diameter_mm": 5.0,
+        "electrode_contact_model": "fixed 5 mm electrode disks; tungsten end-face footprint may be smaller or larger, and only overlap area conducts to 300 K",
         "external_sphere_temperature_k": sphere_temp,
         "external_sphere_emissivity": float(getattr(cfg, "full3d_sphere_emissivity", 1.0)),
         "thermal_radiation_sink_temperature_k": thermal_sink_temp,
@@ -1068,6 +1163,9 @@ def _full3d_metric_snapshot(metrics: Dict[str, float]) -> Dict[str, object]:
         "temperature_violation_ratio",
         "volume_change_ratio_3d",
         "electrode_max_error_m",
+        "electrode_contact_area_m2",
+        "noncontact_end_face_area_m2",
+        "missing_electrode_contact_area_m2",
         "effective_radiating_area_m2",
         "surface_area_ratio",
         "escape_view_factor_proxy",
@@ -1119,7 +1217,7 @@ def _full3d_selection_diagnostics(
         "action_space_full3d": (
             "low-order Chebyshev(z) x Fourier(theta) side-wall radial displacement plus "
             "Chebyshev(radius) x Fourier(theta) top/bottom cap axial displacement; "
-            "5 mm electrode boundary vertices are masked and volume is projected after each action"
+            "axial end planes remain 15 mm apart; contact with the fixed 5 mm electrode disk is computed from footprint overlap after projection"
         ),
         "action_dim_full3d": int(full3d_action_dim(cfg)),
         "cem_elite_fraction_full3d": float(getattr(cfg, "full3d_cem_elite_fraction", 0.35)),
@@ -1341,13 +1439,15 @@ def write_full3d_report(output_dir: str | Path, result: Full3DResult, summary: D
         "## Physics Rules",
         "",
         "- Geometry is a closed 3D mesh; side wall, top face, and bottom face can all move.",
-        "- The two 5 mm circular electrode boundaries keep their diameter and relative position fixed.",
+        "- The transverse electrode separation is fixed at 15 mm.",
+        "- The two 5 mm circular electrode disks keep their diameter and relative position fixed, but the tungsten end-face footprint can change.",
         "- Pre-energization volume is projected back to the initial cylinder volume.",
-        "- The tungsten voltage is applied only between the two tungsten/electrode contact boundaries; electrode voltage drop is zero in this model.",
-        "- The two axial contact boundaries are fixed at 300 K, representing well-cooled copper electrodes with ignored contact resistance.",
-        "- Only free surfaces radiate to the 300 K environment and sublime; contact end faces do not radiate or sublime.",
+        "- The tungsten voltage is applied only between the two tungsten/electrode contact footprints; electrode voltage drop is zero in this model.",
+        "- Electrode cooling is coupled through the actual overlap area between each tungsten end face and the fixed 5 mm electrode disk.",
+        "- End faces do not radiate or sublime, including both regions outside the electrode disk and electrode disk regions no longer touched by tungsten.",
+        "- Only side/free surfaces radiate to the 300 K environment and sublime.",
         "- The optimizer uses CEM over an explicit low-order full3d topology action space; the optional neural policy supplies structured perturbations.",
-        "- The topology action space combines side-wall radial modes over Chebyshev(z) x Fourier(theta) with top/bottom cap axial modes over Chebyshev(radius) x Fourier(theta).",
+        "- The topology action space combines side-wall radial modes over Chebyshev(z) x Fourier(theta) with top/bottom cap in-plane modes over Chebyshev(radius) x Fourier(theta).",
         "",
         "## Selection",
         "",
@@ -1368,6 +1468,9 @@ def write_full3d_report(output_dir: str | Path, result: Full3DResult, summary: D
         f"- Max temperature: `{summary.get('max_temperature_k', 0.0):.6g} K`",
         f"- Temperature violation ratio: `{summary.get('temperature_violation_ratio', 0.0):.6g}`",
         f"- Thermal converged: `{summary.get('thermal_converged', False)}`",
+        f"- Electrode contact area: `{summary.get('electrode_contact_area_m2', 0.0):.6g} m^2`",
+        f"- Non-contact end-face area: `{summary.get('noncontact_end_face_area_m2', 0.0):.6g} m^2`",
+        f"- Missing electrode contact area: `{summary.get('missing_electrode_contact_area_m2', 0.0):.6g} m^2`",
         f"- Volume error: `{summary.get('volume_change_ratio_full3d', 0.0):.6g}`",
         f"- Electrode max error: `{summary.get('electrode_max_error_m', 0.0):.6g} m`",
         f"- Feasible: `{summary.get('feasible', False)}`",

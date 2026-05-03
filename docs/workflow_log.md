@@ -1083,3 +1083,55 @@ CPU smoke 摘要：
 - `feasible = True`
 
 说明：该 smoke 仅验证物理/优化/导出链闭环和口径正确性，不代表长预算 RTX4090 最优结果。
+
+## 24. 端面 footprint 与电极接触面积边界修正
+
+### 24.1 用户新增澄清
+
+用户进一步指出：钨棒横向长度/两端间距始终是 `15mm`，但与电极接触的钨端面可以改变，不一定是 `5mm` 直径圆形。因此端面需要区分：
+
+- 超出固定圆形电极盘的钨端面：不考虑向外辐射、不考虑升华、不参与电极导热。
+- 原本电极盘覆盖但现在没有钨端面接触的区域：不属于钨表面，但会减少电极导热接触面积，从而影响钨棒内部温度分布。
+
+### 24.2 代码修正
+
+- `utils/full3d_optimizer.py`
+  - 不再把端面外缘圆环固定为 `2.5mm` 半径。
+  - `project_full3d_geometry()` 改为保持所有轴向 ring/端面 z 坐标，从而保证端距始终 `15mm`；体积投影只缩放平面内坐标。
+  - 新增端面 footprint 与固定 `5mm` 电极盘的重叠面积计算，输出：
+    - `electrode_contact_area_m2`
+    - `noncontact_end_face_area_m2`
+    - `missing_electrode_contact_area_m2`
+  - 热求解不再把两端节点硬设为 `300K`；改为按照实际接触面积构造到 `300K` 电极的导热通道。
+  - 所有端面区域从辐射和升华面积中排除，只有侧面自由表面参与辐射散热和蒸发寿命。
+  - full3d 动作空间中顶/底面动作从轴向位移改为端面 footprint 的平面内径向位移。
+- `optimize_3d.py`
+  - summary 增加端面 footprint/contact 诊断字段。
+  - 电极约束文案改为“电极盘固定，钨端面 footprint 可变，只有重叠面积导热”。
+- `tests/test_full3d_optimizer.py`
+  - 更新端面动作测试：检查端面 footprint 平面内变化而非 z 方向移动。
+  - 新增接触面积回归测试：端面 footprint 缩小时，电极接触面积下降、缺失接触面积上升，平均温度升高。
+- `config/cylinder_cfg.py`
+  - 新增 `full3d_electrode_contact_length_m`，用于把实际接触面积转换为端部导热通道强度。
+
+### 24.3 文档同步
+
+- `docs/research_solution_zh.md` 已同步端面 footprint 可变、电极盘固定、端面不辐射/不升华、实际重叠面积导热。
+- `docs/cloud_train_rtx4090_zh.md` 已新增服务器结果检查字段：`electrode_contact_area_m2`、`noncontact_end_face_area_m2`、`missing_electrode_contact_area_m2`。
+
+### 24.4 本地验证
+
+已通过：
+
+```bash
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest discover -s tests -p "test_*.py"
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe optimize_3d.py --device cpu --smoke --no-step --experiment-name codex_contact_footprint_smoke
+```
+
+验证结果：
+
+- 单元测试 `11` 项通过。
+- CPU smoke 正常生成 STL/GIF/MP4/summary。
+- smoke 中 `baseline_voltage_v = 0.34`，`final_voltage_v = 0.34`，仍为额定搜索。
+- summary 输出 `electrode_contact_area_m2`、`noncontact_end_face_area_m2`、`missing_electrode_contact_area_m2`。
+- `electrode_max_error_m = 0.0` 表示端距/端面 z 约束满足，不再表示端面半径必须等于 `2.5mm`。

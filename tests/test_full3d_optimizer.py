@@ -109,6 +109,38 @@ class Full3DOptimizerTest(unittest.TestCase):
         displacement = np.linalg.norm(moved.vertices[cap_ids] - baseline.vertices[cap_ids], axis=1)
         self.assertGreater(float(np.max(displacement)), 1.0e-8)
 
+    def test_contact_area_changes_with_end_face_footprint(self) -> None:
+        cfg = self._small_cfg()
+        baseline = project_full3d_geometry(
+            cfg,
+            build_baseline_full3d_geometry(cfg),
+            math.pi * cfg.radius * cfg.radius * cfg.height,
+        )
+        base_metrics = evaluate_full3d_geometry(cfg, baseline)
+        vertices = baseline.vertices.copy()
+        lower_ids = baseline.lower_electrode_indices
+        upper_ids = baseline.upper_electrode_indices
+        vertices[lower_ids, :2] *= 0.75
+        vertices[upper_ids, :2] *= 0.75
+        shrunk = project_full3d_geometry(cfg, baseline, math.pi * cfg.radius * cfg.radius * cfg.height)
+        shrunk = type(baseline)(
+            vertices=vertices,
+            faces=baseline.faces,
+            side_indices=baseline.side_indices,
+            lower_cap_indices=baseline.lower_cap_indices,
+            upper_cap_indices=baseline.upper_cap_indices,
+            lower_electrode_indices=baseline.lower_electrode_indices,
+            upper_electrode_indices=baseline.upper_electrode_indices,
+            num_rings=baseline.num_rings,
+            num_segments=baseline.num_segments,
+            cap_rings=baseline.cap_rings,
+        )
+        shrunk = project_full3d_geometry(cfg, shrunk, math.pi * cfg.radius * cfg.radius * cfg.height)
+        changed = evaluate_full3d_geometry(cfg, shrunk)
+        self.assertLess(changed["electrode_contact_area_m2"], base_metrics["electrode_contact_area_m2"])
+        self.assertGreater(changed["missing_electrode_contact_area_m2"], base_metrics["missing_electrode_contact_area_m2"])
+        self.assertGreater(changed["mean_temperature_k"], base_metrics["mean_temperature_k"])
+
     def test_explicit_topology_action_space_moves_side_and_caps(self) -> None:
         cfg = self._small_cfg()
         baseline = project_full3d_geometry(
@@ -126,7 +158,7 @@ class Full3DOptimizerTest(unittest.TestCase):
         side_delta = np.linalg.norm(moved.vertices[side_ids, :2] - baseline.vertices[side_ids, :2], axis=1)
         cap_ids = np.unique(baseline.lower_cap_indices[1:].reshape(-1))
         cap_ids = cap_ids[cap_ids >= 0]
-        cap_delta = np.abs(moved.vertices[cap_ids, 2] - baseline.vertices[cap_ids, 2])
+        cap_delta = np.linalg.norm(moved.vertices[cap_ids, :2] - baseline.vertices[cap_ids, :2], axis=1)
         self.assertGreater(float(np.max(side_delta)), 1.0e-8)
         self.assertGreater(float(np.max(cap_delta)), 1.0e-8)
         self.assertLessEqual(_electrode_error_for_test(cfg, moved), cfg.full3d_electrode_tolerance_m)
@@ -147,14 +179,13 @@ class Full3DOptimizerTest(unittest.TestCase):
 
 def _electrode_error_for_test(cfg, geometry) -> float:
     points = geometry.vertices[np.concatenate([geometry.lower_electrode_indices, geometry.upper_electrode_indices])]
-    radial = np.linalg.norm(points[:, :2], axis=1)
     target_z = np.concatenate(
         [
             np.full(len(geometry.lower_electrode_indices), -0.5 * cfg.height),
             np.full(len(geometry.upper_electrode_indices), 0.5 * cfg.height),
         ]
     )
-    return float(max(np.max(np.abs(radial - cfg.radius)), np.max(np.abs(points[:, 2] - target_z))))
+    return float(np.max(np.abs(points[:, 2] - target_z)))
 
 
 if __name__ == "__main__":
