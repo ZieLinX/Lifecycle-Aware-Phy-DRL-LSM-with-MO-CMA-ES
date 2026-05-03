@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import csv
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import copy
 from functools import lru_cache
 import io
 import json
 import math
 from pathlib import Path
+import time
 from typing import Dict, List
 
 import imageio.v2 as imageio
@@ -1984,6 +1985,121 @@ def _policy_metrics_stub(archive_metrics: List[Dict[str, float]]) -> Dict[str, o
     }
 
 
+def _full3d_progress_enabled(cfg) -> bool:
+    return bool(getattr(cfg, "full3d_progress", False))
+
+
+def _full3d_progress_detail_enabled(cfg) -> bool:
+    return bool(getattr(cfg, "full3d_progress_detail", False))
+
+
+def _progress_bar(done: int, total: int, width: int = 22) -> str:
+    total = max(int(total), 1)
+    done = min(max(int(done), 0), total)
+    filled = int(round(width * done / total))
+    return "[" + "#" * filled + "." * (width - filled) + "]"
+
+
+def _format_seconds(seconds: float) -> str:
+    seconds = max(float(seconds), 0.0)
+    if seconds < 60.0:
+        return f"{seconds:.0f}s"
+    minutes, sec = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m{sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def _progress_metric_text(metrics: Dict[str, float]) -> str:
+    if not metrics:
+        return ""
+    return (
+        f"score={float(metrics.get('score', 0.0)):.4g} "
+        f"P0={float(metrics.get('P0_escape_0_3um_w', metrics.get('net_radiated_power_0k_sphere_w', 0.0))):.4g}W "
+        f"Pavg={float(metrics.get('lifecycle_avg_escape_0_3um_w', metrics.get('net_radiated_power_0k_sphere_w', 0.0))):.4g}W "
+        f"life_ratio={float(metrics.get('lifetime_ratio_3d', 0.0)):.4g} "
+        f"Tmax={float(metrics.get('max_temperature_k', 0.0)):.1f}K "
+        f"V={float(metrics.get('voltage_v', 0.0)):.4g}V "
+        f"vis={float(metrics.get('escape_visibility_factor', metrics.get('escape_view_factor_proxy', 0.0))):.3f} "
+        f"feasible={bool(metrics.get('constraint_feasible_3d', False))}"
+    )
+
+
+def _progress_print(cfg, message: str) -> None:
+    if _full3d_progress_enabled(cfg):
+        print(message, flush=True)
+
+
+def _evaluate_pending_geometries_with_progress(
+    cfg,
+    pending_geometries: list[Full3DGeometry],
+    baseline_metrics: Dict[str, float] | None,
+    eval_workers: int,
+    generation: int,
+    generations: int,
+) -> list[Dict[str, float]]:
+    total = len(pending_geometries)
+    if total <= 0:
+        return []
+    progress = _full3d_progress_enabled(cfg)
+    detail = _full3d_progress_detail_enabled(cfg)
+    evaluated_metrics: list[Dict[str, float] | None] = [None] * total
+    start = time.perf_counter()
+
+    def on_done(local_idx: int, metrics: Dict[str, float]) -> None:
+        completed = sum(item is not None for item in evaluated_metrics)
+        elapsed = time.perf_counter() - start
+        avg = elapsed / max(completed, 1)
+        eta = avg * max(total - completed, 0)
+        prefix = f"[3d] gen {generation}/{generations} eval {completed}/{total} {_progress_bar(completed, total)}"
+        _progress_print(
+            cfg,
+            f"{prefix} worker={min(eval_workers, total)} elapsed={_format_seconds(elapsed)} eta={_format_seconds(eta)} "
+            + _progress_metric_text(metrics),
+        )
+        if detail:
+            _progress_print(
+                cfg,
+                f"[3d] gen {generation}/{generations} eval {completed}/{total} detail "
+                f"candidate={local_idx + 1}, voltage_evals={int(metrics.get('voltage_search_evaluations', 0))}, "
+                f"lifecycle_steps={int(metrics.get('lifecycle_steps_evaluated', 0))}, "
+                f"thermal_converged={bool(metrics.get('thermal_converged', False))}, "
+                f"feature_failure={metrics.get('feature_failure_reason', '')}",
+            )
+
+    if eval_workers > 1 and total > 1:
+        cfg_payload = copy.copy(cfg)
+        with ThreadPoolExecutor(max_workers=eval_workers) as pool:
+            pending = {
+                pool.submit(_evaluate_geometry_payload, (cfg_payload, geom, baseline_metrics)): idx
+                for idx, geom in enumerate(pending_geometries)
+            }
+            while pending:
+                done, _not_done = wait(pending.keys(), timeout=30.0, return_when=FIRST_COMPLETED)
+                if not done:
+                    completed = sum(item is not None for item in evaluated_metrics)
+                    elapsed = time.perf_counter() - start
+                    _progress_print(
+                        cfg,
+                        f"[3d] gen {generation}/{generations} eval {completed}/{total} {_progress_bar(completed, total)} "
+                        f"still running elapsed={_format_seconds(elapsed)} worker={min(eval_workers, total)}",
+                    )
+                    continue
+                for future in done:
+                    local_idx = pending.pop(future)
+                    metrics = future.result()
+                    evaluated_metrics[local_idx] = metrics
+                    on_done(local_idx, metrics)
+    else:
+        for local_idx, geom in enumerate(pending_geometries):
+            metrics = evaluate_full3d_geometry(cfg, geom, baseline_metrics)
+            evaluated_metrics[local_idx] = metrics
+            on_done(local_idx, metrics)
+
+    return [item if item is not None else {} for item in evaluated_metrics]
+
+
 def _evaluate_candidate_payload(
     payload: tuple[object, np.ndarray, float, bool, int, int],
 ) -> tuple[Full3DGeometry, Dict[str, float], np.ndarray, str]:
@@ -2148,6 +2264,8 @@ def _full3d_selection_diagnostics(
         "visibility_device_full3d": str(getattr(cfg, "full3d_visibility_device", "auto")),
         "eval_workers_full3d": int(getattr(cfg, "full3d_eval_workers", 1)),
         "torch_threads_full3d": int(getattr(cfg, "full3d_torch_threads", 0)),
+        "progress_enabled_full3d": bool(getattr(cfg, "full3d_progress", False)),
+        "progress_detail_full3d": bool(getattr(cfg, "full3d_progress_detail", False)),
         "feature_scale_mode_full3d": str(getattr(cfg, "full3d_feature_scale_mode", "sdf")),
         "max_allowed_temperature_k": float(cfg.max_temp),
         "baseline_feasible_full3d": baseline_feasible,
@@ -2189,12 +2307,18 @@ def run_full3d_optimization(
     torch_threads = int(getattr(cfg, "full3d_torch_threads", 0))
     if torch_threads > 0:
         torch.set_num_threads(torch_threads)
+    run_started = time.perf_counter()
     rng = np.random.default_rng(int(seed))
     device = torch.device(cfg.device if torch.cuda.is_available() and str(cfg.device).startswith("cuda") else "cpu")
+    _progress_print(
+        cfg,
+        "[3d] baseline: building specified 5 mm x 15 mm cylinder and evaluating rated-condition physics",
+    )
     baseline = build_baseline_full3d_geometry(cfg)
     target_volume = math.pi * float(cfg.radius) ** 2 * float(cfg.height)
     baseline = project_full3d_geometry(cfg, baseline, target_volume)
     baseline_metrics = evaluate_full3d_geometry(cfg, baseline)
+    _progress_print(cfg, f"[3d] baseline done: {_progress_metric_text(baseline_metrics)}")
     baseline_metrics["archive_index"] = 0
     policy = Full3DUNetGNNPolicy().to(device)
     policy.eval()
@@ -2214,13 +2338,24 @@ def run_full3d_optimization(
     archive_actions: list[np.ndarray] = [np.zeros(action_dim, dtype=np.float64)]
     archive_geometries: list[Full3DGeometry] = [baseline]
     eval_workers = max(int(getattr(cfg, "full3d_eval_workers", 1)), 1)
+    _progress_print(
+        cfg,
+        f"[3d] optimization start: optimizer={optimizer_name}, objective={getattr(cfg, 'full3d_objective_mode', 'efficiency')}, "
+        f"generations={int(generations)}, population={int(population_size)}, action_dim={action_dim}, "
+        f"eval_workers={eval_workers}, visibility_device={getattr(cfg, 'full3d_visibility_device', 'auto')}",
+    )
 
     for generation in range(1, int(generations) + 1):
+        generation_started = time.perf_counter()
         candidates: list[tuple[Full3DGeometry, Dict[str, float], np.ndarray]] = []
         pending_geometries: list[Full3DGeometry] = []
         pending_actions: list[np.ndarray] = []
         pending_sources: list[str] = []
         requested = max(int(population_size), 1)
+        _progress_print(
+            cfg,
+            f"[3d] gen {generation}/{int(generations)}: sampling {requested} global topology actions",
+        )
         if optimizer_name in {"mo-cmaes", "cmaes", "turbo-surrogate"}:
             sampled_actions = _sample_mocma_actions(rng, mocma_mean, mocma_cov, mocma_sigma, requested)
         else:
@@ -2251,17 +2386,19 @@ def run_full3d_optimization(
             pending_geometries.append(geom)
             pending_actions.append(action.copy())
             pending_sources.append(action_source)
-        if eval_workers > 1 and len(pending_geometries) > 1:
-            cfg_payload = copy.copy(cfg)
-            with ThreadPoolExecutor(max_workers=eval_workers) as pool:
-                evaluated_metrics = list(
-                    pool.map(
-                        _evaluate_geometry_payload,
-                        [(cfg_payload, geom, baseline_metrics) for geom in pending_geometries],
-                    )
-                )
-        else:
-            evaluated_metrics = [evaluate_full3d_geometry(cfg, geom, baseline_metrics) for geom in pending_geometries]
+        _progress_print(
+            cfg,
+            f"[3d] gen {generation}/{int(generations)}: evaluating {len(pending_geometries)} candidates "
+            f"with true physics; each candidate searches voltage and lifecycle",
+        )
+        evaluated_metrics = _evaluate_pending_geometries_with_progress(
+            cfg,
+            pending_geometries,
+            baseline_metrics,
+            eval_workers,
+            generation,
+            int(generations),
+        )
         for local_idx, (geom, action, action_source, metrics) in enumerate(
             zip(pending_geometries, pending_actions, pending_sources, evaluated_metrics)
         ):
@@ -2322,6 +2459,15 @@ def run_full3d_optimization(
                 mocma_sigma_full3d=float(mocma_sigma),
             )
         )
+        elapsed_gen = time.perf_counter() - generation_started
+        elapsed_total = time.perf_counter() - run_started
+        feasible_count = sum(1 for item in archive_metrics if bool(item.get("constraint_feasible_3d", False)))
+        _progress_print(
+            cfg,
+            f"[3d] gen {generation}/{int(generations)} done in {_format_seconds(elapsed_gen)}; "
+            f"archive={len(archive_metrics)}, feasible={feasible_count}, best {_progress_metric_text(best_metrics)}, "
+            f"total_elapsed={_format_seconds(elapsed_total)}",
+        )
 
     assign_pareto_metrics(archive_metrics)
     best_idx = max(range(len(archive_metrics)), key=lambda idx: _pareto_rank_key(archive_metrics[idx]))
@@ -2331,6 +2477,7 @@ def run_full3d_optimization(
     lifecycle_trace: List[Dict[str, object]] = []
     visibility_diagnostics: List[Dict[str, object]] = []
     if 0 <= selected_idx < len(archive_geometries):
+        _progress_print(cfg, f"[3d] final reevaluation: lifecycle trace and visibility diagnostics for archive_index={selected_idx}")
         lifecycle_summary, lifecycle_trace = evaluate_lifecycle(cfg, archive_geometries[selected_idx], baseline_metrics)
         best_metrics.update(lifecycle_summary)
         archive_metrics[selected_idx].update(lifecycle_summary)

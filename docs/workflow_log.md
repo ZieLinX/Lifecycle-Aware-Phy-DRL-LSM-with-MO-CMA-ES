@@ -1448,3 +1448,76 @@ python -u train_policy.py \
 ```
 
 `--compile` 可在长训练时尝试开启；如果首次编译耗时过高或环境不兼容，保持默认关闭即可。所有 surrogate/policy 输出仍只作为候选预筛或策略初始化，最终几何仍必须回到真实 full3d evaluator 验证。
+
+## 28. optimize_3d 进度输出与 GPU 占用说明
+
+### 28.1 用户反馈
+
+用户在 RTX4090 服务器运行 `optimize_3d.py` 后，终端只显示：
+
+```text
+[3d] device: NVIDIA GeForce RTX 4090
+```
+
+同时看到约 3 个 CPU 占用较高的 Python 进程，`nvidia-smi` 中 GPU 占用接近 0%。
+
+### 28.2 现象解释
+
+这是当前 full3d 真实物理评估路径下可能出现的正常现象，不等于程序没有工作：
+
+- `--eval-workers 2` 会让候选级真实物理评估走线程池；每个候选内部包含额定电压搜索、稳态传热、生命周期步进和可见性评估，CPU 侧会持续较高。
+- 可见性 ray cast 只有在 `--visibility-device auto/cuda` 且本机 PyTorch CUDA 可用时才走 CUDA；否则自动回退 CPU。
+- 即使 visibility 走 CUDA，热求解、几何投影、Pareto 排序和生命周期循环仍有大量 CPU/Numpy 工作；CUDA kernel 也可能是短批次，`nvidia-smi` 刷新时看到 0%。
+- 原实现使用 `pool.map(...)`，一代候选全部完成前不输出，配合 `tee` 看起来像卡在启动行。
+
+### 28.3 本轮修正
+
+新增默认开启的 tee 友好进度输出：
+
+- `optimize_3d.py --progress / --no-progress`
+  - 默认 `--progress`。
+  - 每代开始、候选评估、每代结束和最终复评都会输出行式进度。
+- `--progress-detail`
+  - 输出候选电压搜索次数、生命周期步数、热收敛和失效原因等诊断。
+- 多线程候选评估从整批 `pool.map` 改为 future 完成回报；每完成一个候选立即打印：
+
+```text
+[3d] gen 1/30 eval 7/48 [###...................] worker=2 elapsed=4m12s eta=24m30s score=...
+```
+
+新的推荐命令可直接保留默认进度：
+
+```bash
+mkdir -p logs
+python -u optimize_3d.py \
+  --experiment-name mcga_sota_mocma_4090_long \
+  --output-dir outputs/three_d_runs \
+  --device cuda:0 \
+  --optimizer mo-cmaes \
+  --objective-mode sota \
+  --generations 30 \
+  --population-size 48 \
+  --thermal-iters 800 \
+  --lifecycle-steps 16 \
+  --visibility-rays 512 \
+  --visibility-batch-size 512 \
+  --visibility-device auto \
+  --eval-workers 2 \
+  --torch-threads 8 \
+  --no-step \
+  2>&1 | tee -a logs/sota_mocma_long_$(date +%F_%H%M%S).log
+```
+
+若需要确认内部阶段：
+
+```bash
+python -u optimize_3d.py ... --progress-detail 2>&1 | tee -a logs/debug_$(date +%F_%H%M%S).log
+```
+
+若希望 GPU visibility 更明显，可尝试：
+
+- `--visibility-device cuda`
+- `--visibility-batch-size 1024`
+- `--eval-workers 1`
+
+但最终速度不一定单调变快，因为候选真实物理评估仍包含大量 CPU 几何与传热计算。

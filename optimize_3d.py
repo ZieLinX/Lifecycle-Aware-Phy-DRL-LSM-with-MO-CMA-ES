@@ -40,6 +40,8 @@ def _configure_cfg(args):
     cfg.full3d_visibility_device = str(args.visibility_device)
     cfg.full3d_eval_workers = int(args.eval_workers)
     cfg.full3d_torch_threads = int(args.torch_threads)
+    cfg.full3d_progress = bool(args.progress)
+    cfg.full3d_progress_detail = bool(args.progress_detail)
     cfg.full3d_feature_scale_mode = str(args.feature_scale_mode)
     cfg.full3d_surrogate_train_every = int(args.surrogate_train_every)
     if args.action_axial_modes is not None:
@@ -105,6 +107,8 @@ def _build_summary(args, cfg, result, export_info, anim_info) -> dict[str, objec
         "cem_elite_fraction_full3d": float(result.selection_diagnostics.get("cem_elite_fraction_full3d", 0.0)),
         "eval_workers_full3d": int(result.selection_diagnostics.get("eval_workers_full3d", cfg.full3d_eval_workers)),
         "torch_threads_full3d": int(result.selection_diagnostics.get("torch_threads_full3d", cfg.full3d_torch_threads)),
+        "progress_enabled_full3d": bool(result.selection_diagnostics.get("progress_enabled_full3d", cfg.full3d_progress)),
+        "progress_detail_full3d": bool(result.selection_diagnostics.get("progress_detail_full3d", cfg.full3d_progress_detail)),
         "visibility_batch_size_full3d": int(result.selection_diagnostics.get("visibility_batch_size_full3d", cfg.full3d_visibility_batch_size)),
         "visibility_device_full3d": str(result.selection_diagnostics.get("visibility_device_full3d", cfg.full3d_visibility_device)),
         "voltage_search_mode": str(result.best_metrics.get("voltage_search_mode", result.selection_diagnostics.get("voltage_search_mode", ""))),
@@ -189,6 +193,8 @@ def main() -> None:
     parser.add_argument("--visibility-device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--eval-workers", type=int, default=1, help="Thread workers for candidate-level full3d true-physics evaluations.")
     parser.add_argument("--torch-threads", type=int, default=0, help="Set torch CPU threads; 0 keeps the runtime default.")
+    parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True, help="Print tee-friendly progress lines during true-physics optimization.")
+    parser.add_argument("--progress-detail", action="store_true", help="Print slower inner-loop diagnostics such as selected lifecycle reevaluation.")
     parser.add_argument("--feature-scale-mode", choices=["sdf"], default="sdf")
     parser.add_argument("--surrogate-train-every", type=int, default=256)
     parser.add_argument("--action-axial-modes", type=int, default=None)
@@ -215,6 +221,16 @@ def main() -> None:
     cfg = _configure_cfg(args)
     output_dir = Path(args.output_dir) / f"{args.experiment_name}_{datetime.now().strftime('%m-%d-%H-%M')}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    print(
+        "[3d] config: "
+        f"optimizer={args.optimizer}, objective={args.objective_mode}, "
+        f"generations={int(args.generations)}, population={int(args.population_size)}, "
+        f"thermal_iters={int(args.thermal_iters)}, lifecycle_steps={int(args.lifecycle_steps)}, "
+        f"visibility_rays={int(args.visibility_rays)}, visibility_device={args.visibility_device}, "
+        f"eval_workers={int(args.eval_workers)}, torch_threads={int(args.torch_threads)}",
+        flush=True,
+    )
+    print(f"[3d] output dir: {output_dir}", flush=True)
     result = run_full3d_optimization(
         cfg,
         generations=int(args.generations),

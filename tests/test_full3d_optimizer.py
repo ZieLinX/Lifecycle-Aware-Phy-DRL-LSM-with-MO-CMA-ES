@@ -318,12 +318,14 @@ class Full3DOptimizerTest(unittest.TestCase):
         cfg.full3d_objective_mode = "sota"
         cfg.full3d_optimizer = "mo-cmaes"
         cfg.full3d_eval_workers = 2
+        cfg.full3d_progress = True
         result = run_full3d_optimization(cfg, generations=1, population_size=2, seed=4, optimizer="mo-cmaes", objective_mode="sota")
         self.assertIn("P0_escape_0_3um_w", result.best_metrics)
         self.assertIn("lifecycle_avg_escape_0_3um_w", result.best_metrics)
         self.assertIn("pareto_hypervolume", result.selection_diagnostics)
         self.assertEqual(result.selection_diagnostics["optimizer_full3d"], "mo-cmaes")
         self.assertEqual(result.selection_diagnostics["eval_workers_full3d"], 2)
+        self.assertTrue(result.selection_diagnostics["progress_enabled_full3d"])
 
 
 def _electrode_error_for_test(cfg, geometry) -> float:

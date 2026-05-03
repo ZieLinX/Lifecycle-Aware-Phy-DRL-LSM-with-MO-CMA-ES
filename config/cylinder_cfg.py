@@ -102,6 +102,8 @@ class CylinderPhysicsCfg:
     full3d_visibility_use_raycast = True
     full3d_eval_workers = 1
     full3d_torch_threads = 0
+    full3d_progress = False
+    full3d_progress_detail = False
     full3d_feature_scale_mode = "sdf"
     full3d_surrogate_train_every = 256
     full3d_surrogate_min_archive = 512
