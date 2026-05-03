@@ -984,3 +984,38 @@ python -u optimize_3d.py --backend full3d --smoke --no-step --experiment-name fu
 - 补充轴向导热、300K 铜电极固定温度边界、电压只跨钨棒、端面接触区不计辐射/升华的说明。
 - 正式命令保持不加 `--fixed-voltage`，继续让程序搜索 `V<=100V` 的额定工况。
 - 固定电压命令仅保留为诊断模式，并明确固定 20V/100V 不是正式优化口径。
+
+## 22. full3d-only 文档收尾：legacy 1D/RL/hybrid/sidefield 已移除
+
+### 22.1 本轮背景
+
+用户已明确允许删除旧 1D/RL 代码和无用 outputs。代码侧在 full3d 物理口径修正后，进一步移除了 legacy 入口、环境、配置、测试、工具和历史输出；文档同步为 full3d-only 口径。
+
+### 22.2 当前正式工作流
+
+当前仓库正式工作流只保留：
+
+- `optimize_3d.py`
+- `utils/full3d_optimizer.py`
+
+正式优化路线为 full3d 封闭三维 mesh 后端：
+
+- 不再使用 `train_rl.py` / `CylinderVecEnv` 轴对称 RL 路线。
+- 不再使用 `optimize_hybrid.py` / 1D hybrid 路线。
+- 不再使用旧 `sidefield` / `r(z, theta)` 半径场路线。
+- 不再保留 legacy 1D/RL/hybrid/sidefield 相关配置、测试、环境、工具和历史 outputs 作为当前可运行交付。
+
+### 22.3 文档同步
+
+- `docs/cloud_train_rtx4090_zh.md`
+  - 已检查：当前文档已经是 full3d-only 执行文档。
+  - 未再给出 `train_rl.py`、`optimize_hybrid.py` 或 `--backend sidefield` 的正式命令。
+  - 正式命令保持 `python -u optimize_3d.py ...`，默认 full3d。
+- `docs/research_solution_zh.md`
+  - 已从旧 Phy-DRL / hybrid 方案说明改写为 full3d-only 方案说明。
+  - 删除了旧 `train_rl.py`、`optimize_hybrid.py`、axisymmetric ring profile、hybrid outputs 等当前已失效的运行建议。
+  - 保留当前 full3d 物理口径、正式命令、固定电压诊断说明和关键产物列表。
+
+### 22.4 后续阅读口径
+
+`docs/workflow_log.md` 前面的 1D/RL/hybrid/sidefield 内容是历史过程记录，不代表当前仓库仍保留这些入口。后续 agent 应以 `docs/cloud_train_rtx4090_zh.md` 和 `docs/research_solution_zh.md` 的 full3d-only 说法作为当前操作口径。

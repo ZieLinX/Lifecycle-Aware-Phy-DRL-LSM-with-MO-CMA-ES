@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import csv
+from functools import lru_cache
 import io
 import json
 import math
@@ -19,7 +20,36 @@ import torch.nn.functional as F
 import trimesh
 
 from utils.exporter import _run_freecad_stl_to_step
-from utils.rated_condition import blackbody_band_fraction
+
+
+def _trapezoid_integral(y: np.ndarray, x: np.ndarray) -> float:
+    integrate = getattr(np, "trapezoid", None)
+    if callable(integrate):
+        return float(integrate(y, x))
+    integrate = getattr(np, "trapz", None)
+    if callable(integrate):
+        return float(integrate(y, x))
+    if y.size < 2:
+        return 0.0
+    return float(np.sum((x[1:] - x[:-1]) * (y[1:] + y[:-1]) * 0.5))
+
+
+@lru_cache(maxsize=1024)
+def _blackbody_band_fraction_cached(temp_k_rounded: float, upper_um: float) -> float:
+    temp_k = max(float(temp_k_rounded), 100.0)
+    wavelengths_um = np.linspace(0.1, 20.0, 2400)
+    wavelengths_m = wavelengths_um * 1.0e-6
+    c2 = 1.438776877e-2
+    exponent = np.clip(c2 / (wavelengths_m * temp_k), 1.0e-9, 700.0)
+    spectral_shape = 1.0 / (np.power(wavelengths_m, 5) * (np.exp(exponent) - 1.0))
+    total = _trapezoid_integral(spectral_shape, wavelengths_um)
+    band_mask = wavelengths_um <= upper_um
+    in_band = _trapezoid_integral(spectral_shape[band_mask], wavelengths_um[band_mask])
+    return in_band / max(total, 1.0e-12)
+
+
+def blackbody_band_fraction(temp_k: float, upper_um: float) -> float:
+    return _blackbody_band_fraction_cached(round(float(temp_k), 1), float(upper_um))
 
 
 @dataclass(frozen=True)
@@ -682,7 +712,7 @@ def _evaluate_full3d_geometry_at_voltage(
         float(thermal["thermal_balance_residual_w"]) / max(float(getattr(cfg, "full3d_thermal_residual_tol_w", 1.0e-3)), 1.0e-12) - 1.0,
         0.0,
     )
-    lifecycle_reference = float(getattr(cfg, "full3d_lifecycle_reference_s", cfg.lifecycle_reference_s))
+    lifecycle_reference = float(getattr(cfg, "full3d_lifecycle_reference_s", 1.0e27))
     lifecycle_factor = lifetime_s / max(lifetime_s + lifecycle_reference, 1.0e-300)
     rated_operating_score = net_band_power * lifecycle_factor
     feasible = (

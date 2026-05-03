@@ -1,245 +1,83 @@
-# 圆柱钨丝物理信息强化学习方案说明
+# 圆柱钨体 full3d 物理优化方案说明
 
-## 1. 题意统一解释
+## 1. 当前正式工作流
 
-本仓库当前采用如下统一建模口径：
+当前仓库已收敛为 **full3d-only** 工作流：
 
-1. 一次决策表示一次**离线几何更新**，随后执行完整额定工况求解。
-2. `100V` 是**额定工况搜索上限**，不是固定工况电压。
-3. 发射率固定为：
-   - `0-3 um`：`0.35`
-   - 其他波段：`0.15`
-4. 蒸发律采用：
+- 正式入口：`optimize_3d.py`
+- 核心后端：`utils/full3d_optimizer.py`
+- 几何表示：封闭三维 mesh，侧面、顶面、底面均可变化
+- 输出目录：`outputs/three_d_runs/<experiment>_<stamp>/`
+
+旧 1D/RL/hybrid/sidefield 入口、环境、测试和工具已移除；文档中的历史记录仅作为过程复盘，不再作为可运行路线。
+
+## 2. 统一物理口径
+
+- `100V` 是额定工况搜索上限，不是固定工作电压。
+- 正式优化默认搜索 `V <= 100V` 的稳态工况，选择综合辐射收益和蒸发/寿命后的最优稳态。
+- 初始 5mm x 15mm 圆柱的额定电压约 `0.34V`，固定 20V/100V 只适合做过温诊断。
+- 电压只加在钨棒两端，不包含铜电极电压降。
+- 钨棒内部显式计算轴向导热。
+- 两端接触铜电极按 `300K` 固定温度边界处理。
+- 当前口径忽略钨棒-铜电极之间的接触热阻和接触电阻。
+- 自由表面计算向 `300K` 环境的净辐射/散热和升华。
+- 接触铜电极的端面区域不计向外辐射和升华。
+- 0-3 微米有效辐射按外接吸收面统计；发射率使用题面给定口径：
+  - `0-3 um`：`0.35`
+  - 其他波段：`0.15`
+- 蒸发律采用：
 
 $$
 Y_e = A \exp(B / T)
 $$
 
 其中 `A = 3.9e8 [g/(cm^2*s)]`，`B = -1.023e5 [K]`。
-5. 电压只加在钨两侧；端面不计辐射与升华。
 
-## 2. 当前方案的核心变化
+## 3. 几何与约束
 
-原始仓库更接近“无学习规划器 + 一维代理物理”的研究原型。本轮将其扩展为一套更接近 **Phy-DRL with Differentiable Operators** 的可执行工程版本：
+- 通电前材料体积投影回初始圆柱体积。
+- 两端 5mm 圆形电极边界保持直径和相对位置不变。
+- 非电极自由表面允许三维变形。
+- 形状评估同时检查体积、电极误差、温度、寿命和辐射收益。
+- 固定电压模式 `--fixed-voltage <V>` 仅用于诊断固定电压是否过温，不用于正式优化。
 
-1. **策略层（RL）**
-   - 使用 `rl_games` PPO
-   - 运行在 `cuda:0`
-   - 智能体不直接编辑每个体素，而是输出三个低阶策略场系数：
-     - 辐射驱动
-     - 抗蒸发驱动
-     - 电流/电阻驱动
-2. **执行层（物理驱动算子）**
-   - 将策略场与局部物理敏度相乘，得到轴向速度场
-   - 再做拉格朗日式体积投影，去掉净体积漂移
-   - 最终更新 ring profile
-3. **内环求解**
-   - 对给定几何做 `V <= 100V` 的额定工况搜索
-   - 支持 batched rated-condition 求解
-   - 支持瞬态升温轨迹估计
+## 4. 运行命令
 
-## 3. 代码结构
-
-### 3.1 单环境研究原型
-
-- `train.py`
-- `envs/cylinder_env.py`
-- `utils/planner.py`
-
-这条路径保留原有 planner 研究原型，便于与改造前结果对照。
-
-### 3.2 RL 训练路径
-
-- `train_rl.py`
-- `envs/cylinder_vec_env.py`
-- `config/rl_games_ppo.yaml`
-
-这条路径是当前新增的独显 RL 训练入口。
-
-### 3.3 物理与约束模块
-
-- `utils/rated_condition.py`
-  - 额定电压搜索
-  - batched solver
-  - 瞬态轨迹 `simulate_transient_trajectory`
-- `utils/feasibility.py`
-  - 连通性 / 最小截面 / 坡度约束
-- `utils/thermo_mech.py`
-  - 轴向热应力软惩罚
-- `utils/exporter.py`
-  - ring profile -> STL / STP
-- `utils/animation.py`
-  - 导出拓扑演化动画
-
-## 4. 特征尺度定义
-
-题目中的“特征尺度变化超过 20% 即失效”在当前实现中定义为：
-
-### 4.1 主判据
-
-局部等效直径
-
-$$
-d_{eq}(z) = 2r(z)
-$$
-
-失效比定义为：
-
-$$
-\max_z \frac{|d_{eq}(z)-5\text{mm}|}{5\text{mm}}
-$$
-
-这一定义直接对应初始圆柱直径 `5 mm`。
-
-### 4.2 制造附加判据
-
-同时加入以下工艺约束作为软惩罚：
-
-1. 最小颈部直径
-2. 相邻截面面积比
-3. 轴向半径坡度
-
-因此当前的“特征尺度”不是单一数值，而是：
-
-1. 面向题目失效判据的**主特征尺度**
-2. 面向可制造性的**附加特征尺度**
-
-## 5. 双档网格策略
-
-由于 RTX 2050 显存有限，而题目又要求 `0.1 mm` 级离散，本轮使用双档网格：
-
-1. **训练粗网格**
-   - 便于 RL 训练与迭代
-2. **评估细网格**
-   - `num_segments=160`
-   - `num_rings=151`
-   - 满足 `dx <= 0.1 mm`
-
-具体接口：
-
-- `make_training_cfg()`
-- `make_eval_cfg()`
-
-## 6. 奖励与约束
-
-当前奖励由以下几部分组成：
-
-1. 相对基准的带内初始功率提升
-2. 相对基准的平均带内功率提升
-3. 寿命比
-4. 温度均匀性
-5. 带内效率
-6. 指定 `dwell_time` 处的瞬态带内功率
-
-惩罚项包括：
-
-1. 质量损失
-2. 最高温度超限
-3. 特征尺度超限
-4. 体积偏差
-5. 工艺可行性惩罚
-6. 热-机械耦合惩罚
-
-## 7. 导出与可视化
-
-当前结果链支持：
-
-1. `run_summary.json`
-2. `rollout_metrics.csv`
-3. `optimized_cylinder.stl`
-4. `optimized_cylinder.stp`
-5. `topology_evolution.gif`
-6. `topology_evolution.mp4`（若本机编码器可用）
-
-动画展示的是从初始形状到最终形状的轴对称拓扑演化过程，并叠加：
-
-1. step
-2. 额定电压
-3. 带内净辐射功率
-4. 寿命比
-5. 可行性状态
-
-## 8. 实验记录
-
-### 8.1 环境
-
-1. 仓库：`D:\TEMP\codec\make_cylinder_great_again`
-2. 分支：`xzh`
-3. conda 环境：`mcga_xzh`
-4. GPU：`RTX 2050`
-
-### 8.2 已完成的可复现实验
-
-命令：
+快速检查：
 
 ```bash
-conda run -n mcga_xzh python train_rl.py --smoke
+python -u optimize_3d.py --smoke --no-step --experiment-name full3d_smoke
 ```
 
-结果目录：
+正式优化：
 
-- `outputs/final_eval/mcga_phy_drl_22-23-25-50`
+```bash
+python -u optimize_3d.py \
+  --experiment-name mcga_full3d_4090 \
+  --output-dir outputs/three_d_runs \
+  --generations 4 \
+  --population-size 16 \
+  --thermal-iters 640 \
+  --no-step
+```
 
-摘要：
+固定电压诊断示例：
 
-1. GPU 训练链可运行
-2. 细网格重放评估可运行
-3. STL / STP / GIF 已成功导出
-4. 当前 smoke 基线性能不是最终最优，仅用于验证工程闭环
+```bash
+python -u optimize_3d.py --smoke --no-step --experiment-name full3d_fixed20_diag --fixed-voltage 20
+```
 
-## 9. 当前局限
+## 5. 关键产物
 
-当前实现仍是面向竞赛研究原型的近似框架，主要局限为：
+- `optimized_full3d.stl`
+- `optimized_full3d.stp`（未加 `--no-step` 且 FreeCAD 可用时）
+- `topology_evolution_full3d.gif`
+- `topology_evolution_full3d.mp4`
+- `optimization_history_full3d.csv`
+- `run_summary_full3d.json`
+- `design_strategy_report_full3d.md`
 
-1. 外层几何仍以 axisymmetric ring profile 为主，而非完整 3D level-set。
-2. 热、电、蒸发、视因子仍是代理求解，而非全 3D 多物理高保真。
-3. RL 训练在 RTX 2050 上成本较高，长预算训练速度明显慢于最初预估。
-4. 因而本轮把重点放在：
-   - 代码结构正确
-   - 约束闭环正确
-   - 训练链、导出链、动画链全部打通
+## 6. 交接索引
 
-## 10. 新主线：SOTA 取向的混合物理优化方案
-
-用户进一步明确：方案不一定依赖强化学习，更重要的是贴合题目和实际情况，优化效果好、有动态展示，并能给人类设计者启发。因此当前推荐主线调整为：
-
-1. **物理信息候选生成**
-   - 用 Chebyshev 低阶基表示轴向 ring profile。
-   - 电极端面固定为 5mm 圆形。
-   - 对候选 profile 做体积投影、连通性投影和坡度投影，先进入可制造几何空间。
-2. **额定工况搜索**
-   - `100V` 是上限，不是固定工作电压。
-   - 每个几何搜索 `V <= 100V` 的可行额定电压。
-   - 若存在可行电压，只在可行电压中比较目标函数。
-3. **时间搜索**
-   - 不假设某个 dwell time 是最佳。
-   - 在瞬态窗口内计算带内功率、平均功率、峰温和质量损失，选最佳采样时间。
-4. **优化器**
-   - `optimize_hybrid.py` 使用 CEM 全局搜索 + 局部坐标细化。
-   - 所有候选进入 archive。
-   - 最终在 `160 x 151` 细网格上重评估 archive，并只从寿命比例 `>=30%` 的候选里选最终设计。
-5. **解释性**
-   - 自动输出 `design_strategy_report.md`。
-   - 当前最佳细网格可行设计表现为“中部微收颈 + 两侧弱补偿外鼓”，说明在本代理物理下，温和提高局部电阻发热比大幅拓扑变形更稳健。
-
-当前混合优化结果目录：
-
-- `outputs/hybrid_runs/mcga_hybrid_sota_04-30-02-35`
-
-关键指标：
-
-1. 初始 0-3um 净功率：`113.01236 W`
-2. 优化后 0-3um 净功率：`120.88685 W`
-3. 初始功率提升：`+6.97%`
-4. 生命周期平均功率提升：`+6.72%`
-5. 寿命比例：`0.609`
-6. 特征尺度变化：`0.58%`
-7. 体积偏差：`0`
-
-这一路线保留 RL 作为对照，但当前交付和继续研究建议优先使用混合物理优化，因为它更省算力、更稳定、可解释性更强，并且已经满足题目输出链：STL、STP、拓扑演化 GIF/MP4、指标 CSV/JSON 和策略报告。
-
-## 11. 后续 Agent 交接索引
-
-- **RL（`train_rl.py`）与真 3D 优化（`optimize_3d.py`）** 的几何自由度、评估 API 不同；**GIF 为 z–r 剖面**；**GIF 上 `V*` 与 log 不一致** 等已知现象与排查建议，已集中写在 **`docs/workflow_log.md` 第 9 节**。
-- **4090 云端训练步骤** 见 **`docs/cloud_train_rtx4090_zh.md`**。
-- **3D 额定/瞬态已接入混合 3D 优化**（不再折算 1D）的修复说明见 **`docs/workflow_log.md` 第 8 节**。
+- RTX4090 服务器运行说明见 `docs/cloud_train_rtx4090_zh.md`。
+- 历史实现、物理口径修正、legacy 删除记录见 `docs/workflow_log.md`。
