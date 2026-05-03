@@ -246,6 +246,8 @@ class Full3DOptimizerTest(unittest.TestCase):
         cfg = self._small_cfg()
         cfg.full3d_visibility_rays = 12
         cfg.full3d_visibility_patch_limit = 12
+        cfg.full3d_visibility_batch_size = 4
+        cfg.full3d_visibility_device = "cpu"
         baseline = project_full3d_geometry(
             cfg,
             build_baseline_full3d_geometry(cfg),
@@ -270,6 +272,21 @@ class Full3DOptimizerTest(unittest.TestCase):
         notched_factor, _, diagnostics = evaluate_visibility(cfg, notched)
         self.assertGreater(len(diagnostics), 0)
         self.assertLessEqual(notched_factor, base_factor + 0.15)
+
+    def test_visibility_cuda_mode_falls_back_when_unavailable(self) -> None:
+        cfg = self._small_cfg()
+        cfg.full3d_visibility_rays = 4
+        cfg.full3d_visibility_patch_limit = 4
+        cfg.full3d_visibility_batch_size = 2
+        cfg.full3d_visibility_device = "cuda"
+        geom = project_full3d_geometry(
+            cfg,
+            build_baseline_full3d_geometry(cfg),
+            math.pi * cfg.radius * cfg.radius * cfg.height,
+        )
+        factor, _, diagnostics = evaluate_visibility(cfg, geom)
+        self.assertGreaterEqual(factor, 0.0)
+        self.assertGreater(len(diagnostics), 0)
 
     def test_lifecycle_outputs_trace_and_average_power(self) -> None:
         cfg = self._small_cfg()
@@ -300,11 +317,13 @@ class Full3DOptimizerTest(unittest.TestCase):
         cfg = self._small_cfg()
         cfg.full3d_objective_mode = "sota"
         cfg.full3d_optimizer = "mo-cmaes"
+        cfg.full3d_eval_workers = 2
         result = run_full3d_optimization(cfg, generations=1, population_size=2, seed=4, optimizer="mo-cmaes", objective_mode="sota")
         self.assertIn("P0_escape_0_3um_w", result.best_metrics)
         self.assertIn("lifecycle_avg_escape_0_3um_w", result.best_metrics)
         self.assertIn("pareto_hypervolume", result.selection_diagnostics)
         self.assertEqual(result.selection_diagnostics["optimizer_full3d"], "mo-cmaes")
+        self.assertEqual(result.selection_diagnostics["eval_workers_full3d"], 2)
 
 
 def _electrode_error_for_test(cfg, geometry) -> float:

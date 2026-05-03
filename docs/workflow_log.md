@@ -1322,3 +1322,129 @@ C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe optimize_3d.py --device cpu --smo
 - `policy_train_metrics_json`
 
 这些字段比单一 `power_ratio_full3d` 更能反映当前“生命周期感知 + 多目标 Pareto + escaped efficiency”的正式优化口径。
+
+## 27. 性能优化与 GPU 训练命令
+
+### 27.1 本轮性能优化
+
+本轮在 SOTA full3d 路线中新增以下性能入口：
+
+- `--eval-workers`
+  - 对候选级真实物理评估做线程池并行。
+  - 推荐从 `2` 或 `4` 开始，避免 Windows/BLAS/PyTorch 线程过度竞争。
+- `--torch-threads`
+  - 显式设置 PyTorch CPU 线程数。
+  - GPU 长跑时可设为 `4` 到 `8`；CPU smoke 可设为 `2`。
+- `--visibility-batch-size`
+  - 控制 ray-cast visibility 的射线批处理大小。
+  - 默认 `128`，4090 上可尝试 `256` 或 `512`。
+- `--visibility-device`
+  - 支持 `auto`、`cpu`、`cuda`。
+  - `auto` 会在 CUDA 可用时把 visibility triangle/ray intersection 放到 GPU 上批量计算。
+- `train_surrogate.py`
+  - 新增 `--batch-size`、`--amp/--no-amp`、`--compile/--no-compile`、`--torch-threads`。
+  - CUDA 下默认支持 AMP，并使用新版 `torch.amp` 接口。
+- `train_policy.py`
+  - 同步新增 `--batch-size`、`--amp/--no-amp`、`--compile/--no-compile`、`--torch-threads`。
+  - 目标值做 `log1p` 归一化，避免 `lifetime_s` 超大导致数值溢出。
+
+### 27.2 当前测试命令
+
+本地完整单元测试：
+
+```bash
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest discover -s tests -p "test_*.py"
+```
+
+CPU smoke，覆盖 MO-CMA-ES、lifecycle、visibility、Pareto archive 和新增性能参数：
+
+```bash
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe optimize_3d.py --device cpu --smoke --no-step --experiment-name codex_perf_smoke --output-dir outputs/three_d_runs --generations 1 --population-size 3 --thermal-iters 120 --optimizer mo-cmaes --objective-mode sota --lifecycle-steps 2 --visibility-rays 8 --visibility-batch-size 4 --visibility-device cpu --eval-workers 2 --torch-threads 2
+```
+
+### 27.3 RTX4090 完整优化命令
+
+推荐先跑中等预算确认稳定：
+
+```bash
+mkdir -p logs
+python -u optimize_3d.py \
+  --experiment-name mcga_sota_mocma_4090 \
+  --output-dir outputs/three_d_runs \
+  --device cuda:0 \
+  --optimizer mo-cmaes \
+  --objective-mode sota \
+  --generations 12 \
+  --population-size 32 \
+  --thermal-iters 640 \
+  --lifecycle-steps 8 \
+  --visibility-rays 256 \
+  --visibility-batch-size 256 \
+  --visibility-device auto \
+  --eval-workers 2 \
+  --torch-threads 6 \
+  --no-step \
+  2>&1 | tee -a logs/sota_mocma_$(date +%F_%H%M%S).log
+```
+
+长跑建议：
+
+```bash
+mkdir -p logs
+python -u optimize_3d.py \
+  --experiment-name mcga_sota_mocma_4090_long \
+  --output-dir outputs/three_d_runs \
+  --device cuda:0 \
+  --optimizer mo-cmaes \
+  --objective-mode sota \
+  --generations 30 \
+  --population-size 48 \
+  --thermal-iters 800 \
+  --lifecycle-steps 16 \
+  --visibility-rays 512 \
+  --visibility-batch-size 512 \
+  --visibility-device auto \
+  --eval-workers 2 \
+  --torch-threads 8 \
+  --no-step \
+  2>&1 | tee -a logs/sota_mocma_long_$(date +%F_%H%M%S).log
+```
+
+如果 CPU 侧占用太高或 GPU visibility 与多线程抢资源，优先把 `--eval-workers` 降到 `1`，再增加 `--visibility-batch-size`。
+
+### 27.4 Surrogate / Policy GPU 训练命令
+
+假设最新优化输出目录为：
+
+```bash
+RUN_DIR=outputs/three_d_runs/mcga_sota_mocma_4090_long_xx-xx-xx-xx
+```
+
+训练 surrogate：
+
+```bash
+python -u train_surrogate.py \
+  --archive "$RUN_DIR/pareto_archive_full3d.json" \
+  --output "$RUN_DIR/surrogate_train_metrics.json" \
+  --epochs 2000 \
+  --batch-size 2048 \
+  --device cuda:0 \
+  --amp \
+  --torch-threads 8
+```
+
+训练 policy actor：
+
+```bash
+python -u train_policy.py \
+  --archive "$RUN_DIR/pareto_archive_full3d.json" \
+  --output "$RUN_DIR/policy_train_metrics.json" \
+  --updates 2000 \
+  --batch-size 2048 \
+  --action-dim 196 \
+  --device cuda:0 \
+  --amp \
+  --torch-threads 8
+```
+
+`--compile` 可在长训练时尝试开启；如果首次编译耗时过高或环境不兼容，保持默认关闭即可。所有 surrogate/policy 输出仍只作为候选预筛或策略初始化，最终几何仍必须回到真实 full3d evaluator 验证。

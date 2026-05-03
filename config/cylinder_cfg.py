@@ -97,7 +97,11 @@ class CylinderPhysicsCfg:
     full3d_lifecycle_min_dt_s = 1.0e-12
     full3d_visibility_rays = 512
     full3d_visibility_patch_limit = 64
+    full3d_visibility_batch_size = 128
+    full3d_visibility_device = "auto"
     full3d_visibility_use_raycast = True
+    full3d_eval_workers = 1
+    full3d_torch_threads = 0
     full3d_feature_scale_mode = "sdf"
     full3d_surrogate_train_every = 256
     full3d_surrogate_min_archive = 512

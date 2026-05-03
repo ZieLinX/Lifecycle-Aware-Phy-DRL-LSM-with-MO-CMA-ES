@@ -36,6 +36,10 @@ def _configure_cfg(args):
     cfg.full3d_lifecycle_steps = int(args.lifecycle_steps)
     cfg.full3d_lifecycle_time_cap_s = str(args.lifecycle_time_cap_s)
     cfg.full3d_visibility_rays = int(args.visibility_rays)
+    cfg.full3d_visibility_batch_size = int(args.visibility_batch_size)
+    cfg.full3d_visibility_device = str(args.visibility_device)
+    cfg.full3d_eval_workers = int(args.eval_workers)
+    cfg.full3d_torch_threads = int(args.torch_threads)
     cfg.full3d_feature_scale_mode = str(args.feature_scale_mode)
     cfg.full3d_surrogate_train_every = int(args.surrogate_train_every)
     if args.action_axial_modes is not None:
@@ -66,6 +70,7 @@ def _configure_cfg(args):
         cfg.thermal_max_iters = min(int(args.thermal_iters), 240)
         cfg.full3d_lifecycle_steps = min(int(cfg.full3d_lifecycle_steps), 3)
         cfg.full3d_visibility_rays = min(int(cfg.full3d_visibility_rays), 32)
+        cfg.full3d_visibility_batch_size = min(int(cfg.full3d_visibility_batch_size), 64)
     return cfg
 
 
@@ -98,6 +103,10 @@ def _build_summary(args, cfg, result, export_info, anim_info) -> dict[str, objec
         "strategy_channels_full3d": int(result.selection_diagnostics.get("strategy_channels_full3d", 0)),
         "global_shape_steps_full3d": int(result.selection_diagnostics.get("global_shape_steps_full3d", 0)),
         "cem_elite_fraction_full3d": float(result.selection_diagnostics.get("cem_elite_fraction_full3d", 0.0)),
+        "eval_workers_full3d": int(result.selection_diagnostics.get("eval_workers_full3d", cfg.full3d_eval_workers)),
+        "torch_threads_full3d": int(result.selection_diagnostics.get("torch_threads_full3d", cfg.full3d_torch_threads)),
+        "visibility_batch_size_full3d": int(result.selection_diagnostics.get("visibility_batch_size_full3d", cfg.full3d_visibility_batch_size)),
+        "visibility_device_full3d": str(result.selection_diagnostics.get("visibility_device_full3d", cfg.full3d_visibility_device)),
         "voltage_search_mode": str(result.best_metrics.get("voltage_search_mode", result.selection_diagnostics.get("voltage_search_mode", ""))),
         "voltage_constraint": (
             f"fixed diagnostic voltage {float(cfg.full3d_fixed_voltage_v):.6g} V"
@@ -176,6 +185,10 @@ def main() -> None:
     parser.add_argument("--lifecycle-steps", type=int, default=16)
     parser.add_argument("--lifecycle-time-cap-s", type=str, default="auto")
     parser.add_argument("--visibility-rays", type=int, default=512)
+    parser.add_argument("--visibility-batch-size", type=int, default=128)
+    parser.add_argument("--visibility-device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--eval-workers", type=int, default=1, help="Thread workers for candidate-level full3d true-physics evaluations.")
+    parser.add_argument("--torch-threads", type=int, default=0, help="Set torch CPU threads; 0 keeps the runtime default.")
     parser.add_argument("--feature-scale-mode", choices=["sdf"], default="sdf")
     parser.add_argument("--surrogate-train-every", type=int, default=256)
     parser.add_argument("--action-axial-modes", type=int, default=None)

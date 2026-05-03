@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import csv
+from concurrent.futures import ThreadPoolExecutor
+import copy
 from functools import lru_cache
 import io
 import json
@@ -772,6 +774,49 @@ def _ray_triangle_hits_batch(origin: np.ndarray, directions: np.ndarray, triangl
     return hits_any
 
 
+def _ray_triangle_hits_batch_torch(
+    origin: np.ndarray,
+    directions: np.ndarray,
+    triangles: np.ndarray,
+    device: torch.device,
+    chunk_size: int = 128,
+) -> np.ndarray:
+    eps = 1.0e-10
+    dirs = torch.as_tensor(directions, dtype=torch.float32, device=device)
+    tri = torch.as_tensor(triangles, dtype=torch.float32, device=device)
+    org = torch.as_tensor(origin, dtype=torch.float32, device=device)
+    edge1 = tri[:, 1] - tri[:, 0]
+    edge2 = tri[:, 2] - tri[:, 0]
+    tvec = org[None, :] - tri[:, 0]
+    hits = []
+    chunk = max(int(chunk_size), 1)
+    for start in range(0, int(dirs.shape[0]), chunk):
+        d = dirs[start : start + chunk]
+        pvec = torch.cross(d[:, None, :].expand(-1, edge2.shape[0], -1), edge2[None, :, :].expand(d.shape[0], -1, -1), dim=2)
+        det = torch.sum(edge1[None, :, :] * pvec, dim=2)
+        active = torch.abs(det) > eps
+        inv_det = torch.zeros_like(det)
+        inv_det[active] = 1.0 / det[active]
+        u = torch.sum(tvec[None, :, :] * pvec, dim=2) * inv_det
+        active = active & (u >= -1.0e-6) & (u <= 1.0 + 1.0e-6)
+        qvec = torch.cross(tvec[None, :, :].expand(d.shape[0], -1, -1), edge1[None, :, :].expand(d.shape[0], -1, -1), dim=2)
+        v = torch.sum(d[:, None, :] * qvec, dim=2) * inv_det
+        active = active & (v >= -1.0e-6) & ((u + v) <= 1.0 + 1.0e-6)
+        t = torch.sum(edge2[None, :, :] * qvec, dim=2) * inv_det
+        active = active & (t > 1.0e-7)
+        hits.append(torch.any(active, dim=1).detach().cpu())
+    return torch.cat(hits, dim=0).numpy().astype(bool)
+
+
+def _visibility_torch_device(cfg) -> torch.device | None:
+    mode = str(getattr(cfg, "full3d_visibility_device", "auto")).lower()
+    if mode == "cpu":
+        return None
+    if mode in {"auto", "cuda"} and torch.cuda.is_available():
+        return torch.device("cuda")
+    return None
+
+
 def _hemisphere_directions(normal: np.ndarray, count: int) -> np.ndarray:
     n = np.asarray(normal, dtype=np.float64)
     n = n / max(float(np.linalg.norm(n)), 1.0e-12)
@@ -820,6 +865,8 @@ def evaluate_visibility(
         return 0.0, face_escape, diagnostics
     rays = max(int(getattr(cfg, "full3d_visibility_rays", 512)), 1)
     patch_limit = max(int(getattr(cfg, "full3d_visibility_patch_limit", 64)), 1)
+    batch_size = max(int(getattr(cfg, "full3d_visibility_batch_size", 128)), 1)
+    torch_device = _visibility_torch_device(cfg)
     sample_faces = np.arange(side_faces, dtype=np.int64)
     if side_faces > patch_limit:
         sample_faces = np.unique(np.linspace(0, side_faces - 1, patch_limit, dtype=np.int64))
@@ -839,7 +886,10 @@ def evaluate_visibility(
             origin = centers[face_id] + normals[face_id] * 1.0e-8
             dirs = _hemisphere_directions(normals[face_id], rays)
             other_triangles = np.delete(triangles, face_id, axis=0)
-            hits = _ray_triangle_hits_batch(origin, dirs, other_triangles)
+            if torch_device is not None:
+                hits = _ray_triangle_hits_batch_torch(origin, dirs, other_triangles, torch_device, batch_size)
+            else:
+                hits = _ray_triangle_hits_batch(origin, dirs, other_triangles, batch_size)
             escaped = int(np.count_nonzero(~hits))
             escape = float(escaped) / float(rays)
             face_escape[face_id] = escape
@@ -849,6 +899,8 @@ def evaluate_visibility(
                     "area_m2": float(area[face_id]),
                     "escape_visibility_factor": escape,
                     "sampled_rays": int(rays),
+                    "batch_size": int(batch_size),
+                    "device": str(torch_device) if torch_device is not None else "cpu",
                 }
             )
         if sample_faces.size < side_faces:
@@ -1932,6 +1984,30 @@ def _policy_metrics_stub(archive_metrics: List[Dict[str, float]]) -> Dict[str, o
     }
 
 
+def _evaluate_candidate_payload(
+    payload: tuple[object, np.ndarray, float, bool, int, int],
+) -> tuple[Full3DGeometry, Dict[str, float], np.ndarray, str]:
+    cfg, action, target_volume, use_neural_policy, generation, local_idx = payload
+    rng = np.random.default_rng(1000003 * int(generation) + int(local_idx))
+    geom = build_full3d_initial_shape_from_action(
+        cfg,
+        action,
+        target_volume=target_volume,
+        use_neural_policy=False if bool(use_neural_policy) else False,
+        policy=None,
+        device=torch.device("cpu"),
+        rng=rng,
+    )
+    geom = project_full3d_geometry(cfg, geom, target_volume)
+    metrics = evaluate_full3d_geometry(cfg, geom, None)
+    return geom, metrics, action, "thread_eval"
+
+
+def _evaluate_geometry_payload(payload: tuple[object, Full3DGeometry, Dict[str, float] | None]) -> Dict[str, float]:
+    cfg, geom, baseline_metrics = payload
+    return evaluate_full3d_geometry(cfg, geom, baseline_metrics)
+
+
 def _full3d_metric_rank(metrics: Dict[str, float]) -> tuple[int, float]:
     if "pareto_rank" in metrics:
         key = _pareto_rank_key(metrics)
@@ -2068,6 +2144,10 @@ def _full3d_selection_diagnostics(
         "mocma_elite_fraction_full3d": float(getattr(cfg, "full3d_mocma_elite_fraction", 0.40)),
         "lifecycle_steps_full3d": int(getattr(cfg, "full3d_lifecycle_steps", 16)),
         "visibility_rays_full3d": int(getattr(cfg, "full3d_visibility_rays", 512)),
+        "visibility_batch_size_full3d": int(getattr(cfg, "full3d_visibility_batch_size", 128)),
+        "visibility_device_full3d": str(getattr(cfg, "full3d_visibility_device", "auto")),
+        "eval_workers_full3d": int(getattr(cfg, "full3d_eval_workers", 1)),
+        "torch_threads_full3d": int(getattr(cfg, "full3d_torch_threads", 0)),
         "feature_scale_mode_full3d": str(getattr(cfg, "full3d_feature_scale_mode", "sdf")),
         "max_allowed_temperature_k": float(cfg.max_temp),
         "baseline_feasible_full3d": baseline_feasible,
@@ -2106,6 +2186,9 @@ def run_full3d_optimization(
     if objective_mode is not None:
         cfg.full3d_objective_mode = str(objective_mode)
     optimizer_name = str(getattr(cfg, "full3d_optimizer", "cem")).lower()
+    torch_threads = int(getattr(cfg, "full3d_torch_threads", 0))
+    if torch_threads > 0:
+        torch.set_num_threads(torch_threads)
     rng = np.random.default_rng(int(seed))
     device = torch.device(cfg.device if torch.cuda.is_available() and str(cfg.device).startswith("cuda") else "cpu")
     baseline = build_baseline_full3d_geometry(cfg)
@@ -2130,9 +2213,13 @@ def run_full3d_optimization(
     seed_actions = _seed_full3d_actions(cfg)
     archive_actions: list[np.ndarray] = [np.zeros(action_dim, dtype=np.float64)]
     archive_geometries: list[Full3DGeometry] = [baseline]
+    eval_workers = max(int(getattr(cfg, "full3d_eval_workers", 1)), 1)
 
     for generation in range(1, int(generations) + 1):
         candidates: list[tuple[Full3DGeometry, Dict[str, float], np.ndarray]] = []
+        pending_geometries: list[Full3DGeometry] = []
+        pending_actions: list[np.ndarray] = []
+        pending_sources: list[str] = []
         requested = max(int(population_size), 1)
         if optimizer_name in {"mo-cmaes", "cmaes", "turbo-surrogate"}:
             sampled_actions = _sample_mocma_actions(rng, mocma_mean, mocma_cov, mocma_sigma, requested)
@@ -2161,7 +2248,23 @@ def run_full3d_optimization(
                 rng=rng,
             )
             geom = project_full3d_geometry(cfg, geom, target_volume)
-            metrics = evaluate_full3d_geometry(cfg, geom, baseline_metrics)
+            pending_geometries.append(geom)
+            pending_actions.append(action.copy())
+            pending_sources.append(action_source)
+        if eval_workers > 1 and len(pending_geometries) > 1:
+            cfg_payload = copy.copy(cfg)
+            with ThreadPoolExecutor(max_workers=eval_workers) as pool:
+                evaluated_metrics = list(
+                    pool.map(
+                        _evaluate_geometry_payload,
+                        [(cfg_payload, geom, baseline_metrics) for geom in pending_geometries],
+                    )
+                )
+        else:
+            evaluated_metrics = [evaluate_full3d_geometry(cfg, geom, baseline_metrics) for geom in pending_geometries]
+        for local_idx, (geom, action, action_source, metrics) in enumerate(
+            zip(pending_geometries, pending_actions, pending_sources, evaluated_metrics)
+        ):
             metrics["archive_index"] = int(candidate_count)
             metrics["generation"] = int(generation)
             metrics["action_dim_full3d"] = int(action_dim)

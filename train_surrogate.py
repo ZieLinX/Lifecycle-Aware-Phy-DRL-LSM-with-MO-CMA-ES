@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 
 
 TARGET_KEYS = [
@@ -63,10 +64,18 @@ def main() -> None:
     parser.add_argument("--output", type=str, default="surrogate_train_metrics.json")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--torch-threads", type=int, default=0)
     args = parser.parse_args()
 
     x_np, y_np = _load_archive(Path(args.archive))
     device = torch.device(args.device if args.device.startswith("cuda") and torch.cuda.is_available() else "cpu")
+    if int(args.torch_threads) > 0:
+        torch.set_num_threads(int(args.torch_threads))
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
     x_safe = np.nan_to_num(x_np, nan=0.0, posinf=1.0e300, neginf=-1.0e300)
     y_safe = np.nan_to_num(y_np, nan=0.0, posinf=1.0e300, neginf=-1.0e300)
     y_safe = np.sign(y_safe) * np.log1p(np.abs(y_safe))
@@ -77,13 +86,22 @@ def main() -> None:
     x = torch.as_tensor((x_safe - x_mean) / x_std, dtype=torch.float32, device=device)
     y = torch.as_tensor((y_safe - y_mean) / y_std, dtype=torch.float32, device=device)
     model = SurrogateMLP(x.shape[1], y.shape[1]).to(device)
+    if bool(args.compile) and hasattr(torch, "compile"):
+        model = torch.compile(model)
     opt = torch.optim.AdamW(model.parameters(), lr=2.0e-3, weight_decay=1.0e-4)
+    dataset = TensorDataset(x, y)
+    loader = DataLoader(dataset, batch_size=max(int(args.batch_size), 1), shuffle=True)
+    use_amp = bool(args.amp) and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     for _ in range(max(int(args.epochs), 1)):
-        pred = model(x)
-        loss = torch.mean((pred - y) ** 2)
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
+        for xb, yb in loader:
+            opt.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                pred = model(xb)
+                loss = torch.mean((pred - yb) ** 2)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
     with torch.no_grad():
         pred = model(x)
         mae = torch.mean(torch.abs(pred - y), dim=0).detach().cpu().numpy()
@@ -95,6 +113,10 @@ def main() -> None:
         "target_keys": TARGET_KEYS,
         "normalized_mae": {key: float(value) for key, value in zip(TARGET_KEYS, mae)},
         "surrogate_only_final_results_allowed": False,
+        "device": str(device),
+        "batch_size": int(args.batch_size),
+        "amp": bool(use_amp),
+        "compiled": bool(args.compile),
     }
     Path(args.output).write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
 
