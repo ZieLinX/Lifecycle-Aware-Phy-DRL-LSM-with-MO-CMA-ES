@@ -32,6 +32,8 @@ class CylinderPhysicsCfg:
     voltage_refine_points = 7
     voltage_refine_spacing = "log"
     voltage_focus_ratio = 0.18
+    voltage_prune_overheat = True
+    voltage_prune_temperature_factor = 1.05
     min_resistance = 1.0e-6
     max_current = 1.0e9
     external_series_resistance = 0.0

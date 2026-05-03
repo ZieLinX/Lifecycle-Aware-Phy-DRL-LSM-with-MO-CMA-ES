@@ -112,6 +112,8 @@ def _build_summary(args, cfg, result, export_info, anim_info) -> dict[str, objec
         "visibility_batch_size_full3d": int(result.selection_diagnostics.get("visibility_batch_size_full3d", cfg.full3d_visibility_batch_size)),
         "visibility_device_full3d": str(result.selection_diagnostics.get("visibility_device_full3d", cfg.full3d_visibility_device)),
         "voltage_search_mode": str(result.best_metrics.get("voltage_search_mode", result.selection_diagnostics.get("voltage_search_mode", ""))),
+        "voltage_search_evaluations": int(result.best_metrics.get("voltage_search_evaluations", 0)),
+        "voltage_search_pruned": bool(result.best_metrics.get("voltage_search_pruned", False)),
         "voltage_constraint": (
             f"fixed diagnostic voltage {float(cfg.full3d_fixed_voltage_v):.6g} V"
             if cfg.full3d_fixed_voltage_v is not None

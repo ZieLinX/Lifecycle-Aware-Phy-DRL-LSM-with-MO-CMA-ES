@@ -86,6 +86,23 @@ class Full3DResult:
     policy_train_metrics: Dict[str, object] = field(default_factory=dict)
 
 
+@dataclass
+class Full3DGeometryContext:
+    target_volume: float
+    volume: float
+    volume_change: float
+    area: np.ndarray
+    normals: np.ndarray
+    centers: np.ndarray
+    surface_area: float
+    cylinder_area: float
+    contact_metrics: Dict[str, float]
+    free_area: np.ndarray
+    proxy_effective_area_by_ring: np.ndarray
+    side_area: float
+    visibility_cache: Dict[str, object] = field(default_factory=dict)
+
+
 class Full3DUNetGNNPolicy(nn.Module):
     """Small 3D U-Net style encoder plus graph smoothing head for strategy fields.
 
@@ -1091,13 +1108,20 @@ def _evaluate_lifecycle_step_geometry(
     cfg,
     geometry: Full3DGeometry,
     baseline_metrics: Dict[str, float] | None,
+    geometry_context: Full3DGeometryContext | None = None,
 ) -> Dict[str, float]:
     original_tol = getattr(cfg, "full3d_volume_tolerance_ratio", 1.0e-5)
     try:
         # During service, volume loss is the evaporation state variable rather
         # than an initial-design constraint violation.
         cfg.full3d_volume_tolerance_ratio = 1.0e9
-        return evaluate_full3d_geometry(cfg, geometry, baseline_metrics, include_lifecycle=False)
+        return evaluate_full3d_geometry(
+            cfg,
+            geometry,
+            baseline_metrics,
+            include_lifecycle=False,
+            geometry_context=geometry_context,
+        )
     finally:
         cfg.full3d_volume_tolerance_ratio = original_tol
 
@@ -1115,6 +1139,8 @@ def evaluate_lifecycle(
     cfg,
     geometry: Full3DGeometry,
     baseline_metrics: Dict[str, float] | None = None,
+    first_metrics: Dict[str, float] | None = None,
+    geometry_context: Full3DGeometryContext | None = None,
 ) -> tuple[Dict[str, float], List[Dict[str, object]]]:
     target_volume = math.pi * float(cfg.radius) ** 2 * float(cfg.height)
     steps = max(int(getattr(cfg, "full3d_lifecycle_steps", 16)), 1)
@@ -1124,7 +1150,11 @@ def evaluate_lifecycle(
     elapsed = 0.0
     p_integral = 0.0
     mass_loss = 0.0
-    first_metrics = _evaluate_lifecycle_step_geometry(cfg, current, baseline_metrics)
+    context = geometry_context if geometry_context is not None else _build_full3d_geometry_context(cfg, geometry)
+    if first_metrics is None:
+        first_metrics = _evaluate_lifecycle_step_geometry(cfg, current, baseline_metrics, context)
+    else:
+        first_metrics = dict(first_metrics)
     time_cap = _lifecycle_time_cap(cfg, first_metrics, baseline_metrics)
     nominal_life = max(float(first_metrics.get("lifetime_s", time_cap)), float(getattr(cfg, "full3d_lifecycle_min_dt_s", 1.0e-12)))
     dt = max(min(time_cap, nominal_life) / float(steps), float(getattr(cfg, "full3d_lifecycle_min_dt_s", 1.0e-12)))
@@ -1218,6 +1248,38 @@ def _material_properties_np(cfg, temperature: np.ndarray) -> tuple[np.ndarray, n
     return k, rho_elec
 
 
+def _solve_tridiagonal_np(lower: np.ndarray, diag: np.ndarray, upper: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    n = int(len(diag))
+    if n == 0:
+        return np.asarray([], dtype=np.float64)
+    if n == 1:
+        pivot = float(diag[0])
+        if abs(pivot) < 1.0e-18:
+            raise np.linalg.LinAlgError("singular tridiagonal pivot")
+        return np.asarray([float(rhs[0]) / pivot], dtype=np.float64)
+    a = np.asarray(lower, dtype=np.float64).copy()
+    b = np.asarray(diag, dtype=np.float64).copy()
+    c = np.asarray(upper, dtype=np.float64).copy()
+    d = np.asarray(rhs, dtype=np.float64).copy()
+    for idx in range(1, n):
+        pivot = float(b[idx - 1])
+        if abs(pivot) < 1.0e-18:
+            raise np.linalg.LinAlgError("singular tridiagonal pivot")
+        factor = a[idx - 1] / pivot
+        b[idx] -= factor * c[idx - 1]
+        d[idx] -= factor * d[idx - 1]
+    if abs(float(b[-1])) < 1.0e-18:
+        raise np.linalg.LinAlgError("singular tridiagonal pivot")
+    x = np.empty(n, dtype=np.float64)
+    x[-1] = d[-1] / b[-1]
+    for idx in range(n - 2, -1, -1):
+        pivot = float(b[idx])
+        if abs(pivot) < 1.0e-18:
+            raise np.linalg.LinAlgError("singular tridiagonal pivot")
+        x[idx] = (d[idx] - c[idx] * x[idx + 1]) / pivot
+    return x
+
+
 def _evaporation_flux_np(cfg, temperature: np.ndarray) -> np.ndarray:
     temp = np.maximum(np.asarray(temperature, dtype=np.float64), 1.0)
     return float(cfg.evap_A) * np.exp(float(cfg.evap_B) / temp) * 10.0
@@ -1269,12 +1331,19 @@ def _solve_full3d_thermal_state(
     area: np.ndarray,
     normals: np.ndarray,
     centers: np.ndarray,
+    free_area: np.ndarray | None = None,
+    effective_area: np.ndarray | None = None,
+    side_total_area: float | None = None,
+    contact_metrics: Dict[str, float] | None = None,
+    axial_profile: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> Dict[str, float]:
     voltage = max(float(voltage), 0.0)
     electrode_temp = float(cfg.ambient_temp)
-    z, cross_area = _full3d_axial_profile(geometry)
-    free_area, effective_area, side_total_area = _side_surface_lumped_by_ring(geometry, area, normals, centers)
-    contact_metrics = _end_contact_metrics(geometry, cfg)
+    z, cross_area = axial_profile if axial_profile is not None else _full3d_axial_profile(geometry)
+    if free_area is None or effective_area is None or side_total_area is None:
+        free_area, effective_area, side_total_area = _side_surface_lumped_by_ring(geometry, area, normals, centers)
+    if contact_metrics is None:
+        contact_metrics = _end_contact_metrics(geometry, cfg)
     order = np.argsort(z)
     inv_order = np.argsort(order)
     z_s = z[order]
@@ -1353,27 +1422,17 @@ def _solve_full3d_thermal_state(
         thermal_residual = float(np.max(np.abs(residual))) if len(temperature) > 0 else 0.0
 
         node_count = len(temperature)
-        matrix = np.zeros((node_count, node_count), dtype=np.float64)
-        rhs = np.zeros(node_count, dtype=np.float64)
-        for ridx in range(node_count):
-            left = float(conductance[ridx - 1]) if ridx > 0 else 0.0
-            right = float(conductance[ridx]) if ridx < node_count - 1 else 0.0
-            sink_slope = float(rad_slope[ridx] + evap_slope[ridx])
-            contact = float(contact_conductance[ridx])
-            matrix[ridx, ridx] = left + right + sink_slope + contact
-            if ridx > 0:
-                matrix[ridx, ridx - 1] = -left
-            if ridx < node_count - 1:
-                matrix[ridx, ridx + 1] = -right
-            rhs[ridx] += float(
-                joule_node[ridx]
-                - radiation[ridx]
-                - evaporation[ridx]
-                + sink_slope * temperature[ridx]
-                + contact * electrode_temp
-            )
+        left = np.zeros(node_count, dtype=np.float64)
+        right = np.zeros(node_count, dtype=np.float64)
+        left[1:] = conductance
+        right[:-1] = conductance
+        sink_slope = rad_slope + evap_slope
+        diag = left + right + sink_slope + contact_conductance
+        lower = -left[1:]
+        upper = -right[:-1]
+        rhs = joule_node - radiation - evaporation + sink_slope * temperature + contact_conductance * electrode_temp
         try:
-            solved = np.linalg.solve(matrix, rhs)
+            solved = _solve_tridiagonal_np(lower, diag, upper, rhs)
         except np.linalg.LinAlgError:
             diag = np.zeros_like(temperature)
             diag += rad_slope + evap_slope + contact_conductance
@@ -1455,6 +1514,31 @@ def _solve_full3d_thermal_state(
     }
 
 
+def _build_full3d_geometry_context(cfg, geometry: Full3DGeometry) -> Full3DGeometryContext:
+    target_volume = math.pi * float(cfg.radius) ** 2 * float(cfg.height)
+    volume = mesh_volume(geometry)
+    volume_change = abs(volume - target_volume) / max(target_volume, 1.0e-18)
+    area, normals, centers = _mesh_area_normals_centers(geometry)
+    surface_area = float(np.sum(area))
+    cylinder_area = 2.0 * math.pi * float(cfg.radius) * float(cfg.height) + 2.0 * math.pi * float(cfg.radius) ** 2
+    contact_metrics = _end_contact_metrics(geometry, cfg)
+    free_area, proxy_effective_area_by_ring, side_area = _side_surface_lumped_by_ring(geometry, area, normals, centers)
+    return Full3DGeometryContext(
+        target_volume=float(target_volume),
+        volume=float(volume),
+        volume_change=float(volume_change),
+        area=area,
+        normals=normals,
+        centers=centers,
+        surface_area=float(surface_area),
+        cylinder_area=float(cylinder_area),
+        contact_metrics=contact_metrics,
+        free_area=free_area,
+        proxy_effective_area_by_ring=proxy_effective_area_by_ring,
+        side_area=float(side_area),
+    )
+
+
 def _full3d_fixed_voltage(cfg) -> float | None:
     voltage = getattr(cfg, "full3d_fixed_voltage_v", None)
     return None if voltage is None else float(voltage)
@@ -1491,26 +1575,38 @@ def _evaluate_full3d_geometry_at_voltage(
     voltage: float,
     baseline_metrics: Dict[str, float] | None = None,
     visibility_cache: Dict[str, object] | None = None,
+    geometry_context: Full3DGeometryContext | None = None,
 ) -> Dict[str, float]:
-    target_volume = math.pi * float(cfg.radius) ** 2 * float(cfg.height)
-    volume = mesh_volume(geometry)
-    volume_change = abs(volume - target_volume) / max(target_volume, 1.0e-18)
-    area, normals, centers = _mesh_area_normals_centers(geometry)
+    context = geometry_context if geometry_context is not None else _build_full3d_geometry_context(cfg, geometry)
+    area = context.area
+    normals = context.normals
+    centers = context.centers
     voltage = float(voltage)
-    surface_area = float(np.sum(area))
-    cylinder_area = 2.0 * math.pi * float(cfg.radius) * float(cfg.height) + 2.0 * math.pi * float(cfg.radius) ** 2
-    contact_metrics = _end_contact_metrics(geometry, cfg)
-    thermal = _solve_full3d_thermal_state(cfg, voltage, geometry, area, normals, centers)
+    contact_metrics = context.contact_metrics
+    thermal = _solve_full3d_thermal_state(
+        cfg,
+        voltage,
+        geometry,
+        area,
+        normals,
+        centers,
+        free_area=context.free_area,
+        effective_area=context.proxy_effective_area_by_ring,
+        side_total_area=context.side_area,
+        contact_metrics=contact_metrics,
+    )
     temperature_profile = np.asarray(thermal["temperature_profile_k"], dtype=np.float64)
     max_temperature = float(thermal["max_temperature_k"])
     mean_temperature = float(thermal["mean_temperature_k"])
-    free_area, proxy_effective_area_by_ring, side_area = _side_surface_lumped_by_ring(geometry, area, normals, centers)
+    free_area = context.free_area
+    proxy_effective_area_by_ring = context.proxy_effective_area_by_ring
+    side_area = float(context.side_area)
     visibility_factor = float(np.sum(proxy_effective_area_by_ring) / max(side_area, 1.0e-12))
     visibility_mode = "center-normal-proxy"
     visibility_rays = 0
     effective_area_by_ring = proxy_effective_area_by_ring
     if str(getattr(cfg, "full3d_objective_mode", "efficiency")).lower() in {"lifecycle", "sota"}:
-        cache = visibility_cache if visibility_cache is not None else {}
+        cache = visibility_cache if visibility_cache is not None else context.visibility_cache
         if "face_escape" not in cache:
             factor, face_escape, diagnostics = evaluate_visibility(cfg, geometry, area, normals, centers)
             cache["visibility_factor"] = float(factor)
@@ -1594,7 +1690,7 @@ def _evaluate_full3d_geometry_at_voltage(
     rated_operating_score = efficiency * lifecycle_factor
     radiation_efficiency_score = efficiency_ratio
     feasible = (
-        volume_change <= float(getattr(cfg, "full3d_volume_tolerance_ratio", 1.0e-5))
+        context.volume_change <= float(getattr(cfg, "full3d_volume_tolerance_ratio", 1.0e-5))
         and electrode_error <= float(getattr(cfg, "full3d_electrode_tolerance_m", 2.0e-6))
         and max_temperature <= float(cfg.max_temp)
         and lifetime_ratio >= float(cfg.minimum_lifetime_ratio)
@@ -1604,8 +1700,8 @@ def _evaluate_full3d_geometry_at_voltage(
         efficiency_ratio
         + 0.08 * (net_band_power / baseline_power)
         + 0.05 * min(lifetime_ratio, 10.0)
-        + 0.02 * (float(thermal["effective_radiating_area_m2"]) / max(cylinder_area, 1.0e-12))
-        - 80.0 * volume_change
+        + 0.02 * (float(thermal["effective_radiating_area_m2"]) / max(context.cylinder_area, 1.0e-12))
+        - 80.0 * context.volume_change
         - 1.0e5 * electrode_error
         - 60.0 * temperature_violation_ratio
         - 50.0 * max(float(cfg.minimum_lifetime_ratio) - lifetime_ratio, 0.0)
@@ -1640,8 +1736,8 @@ def _evaluate_full3d_geometry_at_voltage(
         "lifecycle_factor_full3d": float(lifecycle_factor),
         "effective_radiating_area_m2": float(thermal["effective_radiating_area_m2"]),
         "side_surface_area_m2": float(side_area),
-        "surface_area_m2": float(surface_area),
-        "surface_area_ratio": float(surface_area / max(cylinder_area, 1.0e-12)),
+        "surface_area_m2": float(context.surface_area),
+        "surface_area_ratio": float(context.surface_area / max(context.cylinder_area, 1.0e-12)),
         "free_radiating_surface_area_m2": float(side_area),
         "free_surface_thermal_balance_area_m2": float(side_area),
         "contact_end_face_area_m2": float(contact_metrics["electrode_contact_area_m2"]),
@@ -1661,8 +1757,8 @@ def _evaluate_full3d_geometry_at_voltage(
         "lifetime_ratio_3d": float(lifetime_ratio),
         "mass_loss_rate_kg_s": float(mass_loss_rate),
         "temperature_violation_ratio": float(temperature_violation_ratio),
-        "volume_m3": float(volume),
-        "volume_change_ratio_3d": float(volume_change),
+        "volume_m3": float(context.volume),
+        "volume_change_ratio_3d": float(context.volume_change),
         "electrode_max_error_m": float(electrode_error),
         "constraint_feasible_3d": bool(feasible),
         "top_bottom_faces_variable": True,
@@ -1710,14 +1806,23 @@ def _search_full3d_rated_condition(
     cfg,
     geometry: Full3DGeometry,
     baseline_metrics: Dict[str, float] | None = None,
+    geometry_context: Full3DGeometryContext | None = None,
 ) -> Dict[str, float]:
     evaluated: Dict[float, Dict[str, float]] = {}
-    visibility_cache: Dict[str, object] = {}
+    context = geometry_context if geometry_context is not None else _build_full3d_geometry_context(cfg, geometry)
+    visibility_cache = context.visibility_cache
 
     def evaluate(voltage_v: float) -> Dict[str, float]:
         key = round(float(voltage_v), 8)
         if key not in evaluated:
-            metrics = _evaluate_full3d_geometry_at_voltage(cfg, geometry, float(voltage_v), baseline_metrics, visibility_cache)
+            metrics = _evaluate_full3d_geometry_at_voltage(
+                cfg,
+                geometry,
+                float(voltage_v),
+                baseline_metrics,
+                visibility_cache,
+                geometry_context=context,
+            )
             metrics["voltage_search_mode"] = "rated_search"
             evaluated[key] = metrics
         return evaluated[key]
@@ -1731,10 +1836,14 @@ def _search_full3d_rated_condition(
     )
     seed_grid = _full3d_seed_voltages(cfg)
     search_grid = np.unique(np.concatenate([coarse_grid, seed_grid])) if seed_grid.size else coarse_grid
-    for voltage_v in search_grid:
+    overheat_limit = float(cfg.max_temp) * float(getattr(cfg, "voltage_prune_temperature_factor", 1.05))
+    prune_overheat = bool(getattr(cfg, "voltage_prune_overheat", True))
+    for voltage_v in sorted(float(value) for value in search_grid):
         metrics = evaluate(float(voltage_v))
         if best is None or _full3d_voltage_rank(metrics) > _full3d_voltage_rank(best):
             best = metrics
+        if prune_overheat and float(metrics.get("max_temperature_k", 0.0)) > overheat_limit:
+            break
 
     if best is None:
         raise RuntimeError("Full3D rated-condition search failed to evaluate any voltage.")
@@ -1755,6 +1864,8 @@ def _search_full3d_rated_condition(
             metrics = evaluate(float(voltage_v))
             if _full3d_voltage_rank(metrics) > _full3d_voltage_rank(best):
                 best = metrics
+            if prune_overheat and float(metrics.get("max_temperature_k", 0.0)) > overheat_limit and float(voltage_v) >= center:
+                break
         span *= 0.35
 
     feasible_count = sum(1 for item in evaluated.values() if bool(item.get("constraint_feasible_3d", False)))
@@ -1763,6 +1874,11 @@ def _search_full3d_rated_condition(
     best["rated_voltage_upper_bound_v"] = float(cfg.max_voltage)
     best["voltage_search_evaluations"] = int(len(evaluated))
     best["voltage_search_feasible_count"] = int(feasible_count)
+    best["voltage_search_pruned"] = bool(
+        prune_overheat
+        and any(float(item.get("max_temperature_k", 0.0)) > overheat_limit for item in evaluated.values())
+        and int(len(evaluated)) < int(len(search_grid)) + int(cfg.voltage_refine_levels) * int(cfg.voltage_refine_points)
+    )
     return best
 
 
@@ -1771,12 +1887,20 @@ def evaluate_full3d_geometry(
     geometry: Full3DGeometry,
     baseline_metrics: Dict[str, float] | None = None,
     include_lifecycle: bool = True,
+    geometry_context: Full3DGeometryContext | None = None,
 ) -> Dict[str, float]:
+    context = geometry_context if geometry_context is not None else _build_full3d_geometry_context(cfg, geometry)
     fixed_voltage = _full3d_fixed_voltage(cfg)
     if fixed_voltage is not None:
-        metrics = _evaluate_full3d_geometry_at_voltage(cfg, geometry, fixed_voltage, baseline_metrics)
+        metrics = _evaluate_full3d_geometry_at_voltage(
+            cfg,
+            geometry,
+            fixed_voltage,
+            baseline_metrics,
+            geometry_context=context,
+        )
     else:
-        metrics = _search_full3d_rated_condition(cfg, geometry, baseline_metrics)
+        metrics = _search_full3d_rated_condition(cfg, geometry, baseline_metrics, geometry_context=context)
     metrics.update(evaluate_feature_scales(cfg, geometry))
     objective_mode = str(getattr(cfg, "full3d_objective_mode", "efficiency")).lower()
     metrics["objective_mode_full3d"] = objective_mode
@@ -1785,7 +1909,13 @@ def evaluate_full3d_geometry(
     metrics["lifecycle_avg_escape_0_3um_w"] = float(metrics.get("P0_escape_0_3um_w", 0.0))
     metrics["feature_failure_reason"] = str(metrics.get("feature_failure_reason", "steady_recession_estimate"))
     if include_lifecycle and objective_mode in {"lifecycle", "sota"}:
-        lifecycle, _trace = evaluate_lifecycle(cfg, geometry, baseline_metrics)
+        lifecycle, _trace = evaluate_lifecycle(
+            cfg,
+            geometry,
+            baseline_metrics,
+            first_metrics=metrics,
+            geometry_context=context,
+        )
         metrics.update(lifecycle)
         if baseline_metrics is not None:
             baseline_p0 = max(float(baseline_metrics.get("P0_escape_0_3um_w", baseline_metrics.get("net_radiated_power_0k_sphere_w", 0.0))), 1.0e-9)
@@ -2042,7 +2172,6 @@ def _evaluate_pending_geometries_with_progress(
     total = len(pending_geometries)
     if total <= 0:
         return []
-    progress = _full3d_progress_enabled(cfg)
     detail = _full3d_progress_detail_enabled(cfg)
     evaluated_metrics: list[Dict[str, float] | None] = [None] * total
     start = time.perf_counter()
@@ -2072,7 +2201,7 @@ def _evaluate_pending_geometries_with_progress(
         cfg_payload = copy.copy(cfg)
         with ThreadPoolExecutor(max_workers=eval_workers) as pool:
             pending = {
-                pool.submit(_evaluate_geometry_payload, (cfg_payload, geom, baseline_metrics)): idx
+                pool.submit(_evaluate_geometry_payload, (copy.copy(cfg_payload), geom, baseline_metrics)): idx
                 for idx, geom in enumerate(pending_geometries)
             }
             while pending:

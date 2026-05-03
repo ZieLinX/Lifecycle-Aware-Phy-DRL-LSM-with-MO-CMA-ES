@@ -11,6 +11,7 @@ from utils.full3d_optimizer import (
     Full3DUNetGNNPolicy,
     _apply_strategy_displacement,
     _apply_full3d_topology_action,
+    _solve_tridiagonal_np,
     build_full3d_initial_shape_from_action,
     build_baseline_full3d_geometry,
     assign_pareto_metrics,
@@ -50,6 +51,16 @@ class Full3DOptimizerTest(unittest.TestCase):
         cfg.full3d_visibility_rays = 8
         cfg.full3d_visibility_patch_limit = 8
         return cfg
+
+    def test_tridiagonal_solver_matches_dense_solve(self) -> None:
+        lower = np.asarray([-1.0, -1.5, -0.75], dtype=np.float64)
+        diag = np.asarray([4.0, 5.0, 4.5, 3.5], dtype=np.float64)
+        upper = np.asarray([-0.5, -1.25, -1.0], dtype=np.float64)
+        rhs = np.asarray([2.0, 1.0, 3.0, 0.5], dtype=np.float64)
+        matrix = np.diag(diag) + np.diag(lower, k=-1) + np.diag(upper, k=1)
+        expected = np.linalg.solve(matrix, rhs)
+        actual = _solve_tridiagonal_np(lower, diag, upper, rhs)
+        np.testing.assert_allclose(actual, expected, rtol=1.0e-12, atol=1.0e-12)
 
     def test_baseline_closed_mesh_preserves_volume_and_electrodes(self) -> None:
         cfg = self._small_cfg()

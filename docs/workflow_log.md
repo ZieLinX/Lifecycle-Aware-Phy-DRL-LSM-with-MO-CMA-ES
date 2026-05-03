@@ -1521,3 +1521,66 @@ python -u optimize_3d.py ... --progress-detail 2>&1 | tee -a logs/debug_$(date +
 - `--eval-workers 1`
 
 但最终速度不一定单调变快，因为候选真实物理评估仍包含大量 CPU 几何与传热计算。
+
+## 29. full3d 真实物理评估进一步性能优化
+
+### 29.1 改动目标
+
+继续优化 `optimize_3d.py --optimizer mo-cmaes --objective-mode sota` 的单候选真实物理评估耗时，保持最终候选仍由真实 physics evaluator 验证，不引入 surrogate-only 结果。
+
+### 29.2 本轮优化点
+
+- 新增每个几何的 `Full3DGeometryContext`：
+  - 同一候选在额定电压搜索的多个电压点中复用 mesh 面积、法向、中心、侧壁面积、端面接触面积、体积误差等静态几何量。
+  - visibility ray-cast 缓存挂到该 context 上，避免同一几何重复 ray-cast。
+- 生命周期第 0 步复用外层额定工况结果：
+  - SOTA 评分原先会先评估初始 `P0`，再在 lifecycle 第 0 步对同一未蒸发几何重新评估一次。
+  - 现在 `evaluate_lifecycle(..., first_metrics=...)` 直接复用外层真实评估结果，减少一次完整额定搜索。
+- 热求解线性系统从 dense `np.linalg.solve` 换为 Thomas 三对角求解：
+  - 稳态轴向传热离散矩阵本质是三对角矩阵。
+  - 新增 `_solve_tridiagonal_np()`，减少每次热迭代矩阵构造和通用求解开销。
+- 电压搜索加入过热剪枝：
+  - `voltage_prune_overheat=True`
+  - `voltage_prune_temperature_factor=1.05`
+  - 若升序电压搜索中某点 `Tmax > 1.05 * Tmax_limit`，后续更高电压点不再真实求解。
+  - summary 新增 `voltage_search_evaluations`、`voltage_search_pruned`。
+
+### 29.3 验证
+
+本地单元测试通过：
+
+```powershell
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest discover -s tests -p "test_*.py"
+```
+
+CPU smoke 通过：
+
+```powershell
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe optimize_3d.py --device cpu --smoke --no-step --experiment-name codex_perf2_smoke --output-dir outputs/three_d_runs --generations 1 --population-size 3 --thermal-iters 120 --optimizer mo-cmaes --objective-mode sota --lifecycle-steps 2 --visibility-rays 8 --visibility-batch-size 4 --visibility-device cpu --eval-workers 2 --torch-threads 2
+```
+
+该 smoke 中 summary 显示 `voltage_search_evaluations=11`、`voltage_search_pruned=True`，说明过热剪枝生效。
+
+### 29.4 使用建议
+
+4090 长跑仍建议使用：
+
+```bash
+python -u optimize_3d.py \
+  --experiment-name mcga_sota_mocma_4090_long \
+  --output-dir outputs/three_d_runs \
+  --device cuda:0 \
+  --optimizer mo-cmaes \
+  --objective-mode sota \
+  --generations 30 \
+  --population-size 48 \
+  --thermal-iters 800 \
+  --lifecycle-steps 16 \
+  --visibility-rays 512 \
+  --visibility-batch-size 512 \
+  --visibility-device auto \
+  --eval-workers 2 \
+  --torch-threads 8 \
+  --no-step \
+  2>&1 | tee -a logs/sota_mocma_long_$(date +%F_%H%M%S).log
+```
