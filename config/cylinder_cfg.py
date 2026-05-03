@@ -90,6 +90,23 @@ class CylinderPhysicsCfg:
     full3d_cem_initial_sigma = 1.10
     full3d_cem_min_sigma = 0.05
     full3d_cem_smoothing = 0.55
+    full3d_optimizer = "cem"
+    full3d_objective_mode = "efficiency"
+    full3d_lifecycle_steps = 16
+    full3d_lifecycle_time_cap_s = "auto"
+    full3d_lifecycle_min_dt_s = 1.0e-12
+    full3d_visibility_rays = 512
+    full3d_visibility_patch_limit = 64
+    full3d_visibility_use_raycast = True
+    full3d_feature_scale_mode = "sdf"
+    full3d_surrogate_train_every = 256
+    full3d_surrogate_min_archive = 512
+    full3d_surrogate_infill_candidates = 256
+    full3d_surrogate_verify_topk = 32
+    full3d_mocma_initial_sigma = 1.10
+    full3d_mocma_min_sigma = 0.03
+    full3d_mocma_smoothing = 0.45
+    full3d_mocma_elite_fraction = 0.40
 
     # Export settings.
     freecad_cmd = ""

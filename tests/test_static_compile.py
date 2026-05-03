@@ -11,6 +11,8 @@ class StaticCompileTest(unittest.TestCase):
     def test_sources_compile(self) -> None:
         files = [
             ROOT / "optimize_3d.py",
+            ROOT / "train_policy.py",
+            ROOT / "train_surrogate.py",
             ROOT / "config" / "cylinder_cfg.py",
             ROOT / "utils" / "exporter.py",
             ROOT / "utils" / "full3d_optimizer.py",

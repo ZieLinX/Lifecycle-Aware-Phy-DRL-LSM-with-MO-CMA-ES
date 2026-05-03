@@ -1229,3 +1229,96 @@ CPU smoke 摘要：
 - `selection_reason_full3d = selected feasible globally parameterized initial shape with highest constrained rated-efficiency score`
 
 该结果说明 smoke 已选中非基线的全局初始形状候选；`final_voltage_v` 没有接近 `100V`，符合“100V 只是上限而不是目标电压”的物理口径。
+
+## 26. Lifecycle-Aware Phy-DRL-LSM SOTA 升级
+
+### 26.1 本轮实现概览
+
+本轮在 full3d 全局初始形状 strategy-field 路线之上，升级为 **Lifecycle-Aware Phy-DRL-LSM SOTA** 工作流。核心变化是：优化器不只比较单个额定稳态的效率，还显式记录生命周期准静态演化、可见性遮挡、特征尺度失效和多目标 Pareto archive，便于后续在效率、寿命、温度、可制造性之间做可解释选择。
+
+### 26.2 新增 CLI
+
+`optimize_3d.py` 新增或同步以下入口参数：
+
+- `--optimizer`
+  - 支持 `cem`、`cmaes`、`mo-cmaes`、`turbo-surrogate`。
+  - 默认使用 `mo-cmaes`，用于多目标策略场搜索和 Pareto archive 构建。
+- `--objective-mode`
+  - 支持 `efficiency`、`lifecycle`、`sota`。
+  - 默认 `sota`，将额定效率、生命周期、温度/寿命约束和特征尺度约束统一纳入选择逻辑。
+- `--lifecycle-steps`
+  - 控制 quasi-static lifecycle trace 的离散步数。
+- `--visibility-rays`
+  - 控制 ray-cast visibility 诊断射线数量。
+- `--feature-scale-mode`
+  - 当前支持 `sdf`，用于特征尺度失效判据。
+- `--surrogate-train-every`
+  - 控制 surrogate/加速优化相关训练或刷新频率。
+
+### 26.3 新增优化与诊断模块口径
+
+- **MO-CMA-ES / Pareto archive**
+  - 在 strategy-field action 空间内做多目标采样和更新。
+  - archive 保留候选的非支配排序、约束状态、效率、寿命、温度、体积和几何诊断。
+- **quasi-static lifecycle trace**
+  - 对选中候选记录随蒸发/升华推进的准静态生命周期轨迹。
+  - 用于确认 `lifetime >= 30% baseline` 不是只在额定初始时刻成立。
+- **ray-cast visibility**
+  - 对自由表面到外接吸收面的可逃逸辐射做 ray-cast visibility 诊断。
+  - 输出遮挡/可见性相关字段，区分几何表面积增加和实际 escaped `0-3um` 有效输出。
+- **feature-scale failure**
+  - 增加基于 `feature-scale-mode=sdf` 的特征尺度失效检查。
+  - 用于约束蒸发/升华导致的关键尺度变化，避免只优化短时高效率但快速失效的形状。
+- **surrogate / policy scaffold**
+  - 新增 `train_surrogate.py`，用于基于 `pareto_archive_full3d.json` 的 surrogate 训练脚手架。
+  - 新增 `train_policy.py`，用于基于 Pareto archive 的 policy 蒸馏/训练脚手架。
+  - 当前主优化仍以真实 full3d 物理评估为准，训练脚手架用于后续加速和策略复用。
+
+### 26.4 新增产物
+
+正式 full3d 输出目录中新增：
+
+- `pareto_archive_full3d.csv`
+- `pareto_archive_full3d.json`
+- `lifecycle_trace_full3d.csv`
+- `visibility_diagnostics_full3d.csv`
+- `surrogate_train_metrics.json`
+- `policy_train_metrics.json`
+
+其中：
+
+- `pareto_archive_full3d.csv/json` 是候选级多目标诊断和非支配结果。
+- `lifecycle_trace_full3d.csv` 是选中几何的准静态生命周期演化。
+- `visibility_diagnostics_full3d.csv` 是 ray-cast escaped visibility 诊断。
+- `surrogate_train_metrics.json` 与 `policy_train_metrics.json` 记录训练脚手架状态、样本量和指标。
+
+### 26.5 本地验证
+
+本轮本地验证命令：
+
+```bash
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest discover -s tests -p "test_*.py"
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe optimize_3d.py --device cpu --smoke --no-step --experiment-name codex_lifecycle_sota_smoke --output-dir outputs/three_d_runs --generations 1 --population-size 3 --thermal-iters 120
+```
+
+验证重点：
+
+- `unittest discover` 覆盖 full3d optimizer、静态编译、产物导出和新增诊断路径。
+- CPU smoke 能完成 `mo-cmaes` 默认优化入口、额定电压搜索、生命周期/可见性诊断和产物写出。
+- smoke 输出目录应包含 `pareto_archive_full3d.csv/json`、`lifecycle_trace_full3d.csv`、`visibility_diagnostics_full3d.csv`、`surrogate_train_metrics.json`、`policy_train_metrics.json`。
+
+### 26.6 后续阅读口径
+
+后续 agent 判断当前 full3d SOTA 路线时，应优先查看：
+
+- `optimizer_full3d`
+- `objective_mode_full3d`
+- `optimization_target_full3d`
+- `pareto_archive_csv`
+- `pareto_archive_json`
+- `lifecycle_trace_csv`
+- `visibility_diagnostics_csv`
+- `surrogate_train_metrics_json`
+- `policy_train_metrics_json`
+
+这些字段比单一 `power_ratio_full3d` 更能反映当前“生命周期感知 + 多目标 Pareto + escaped efficiency”的正式优化口径。

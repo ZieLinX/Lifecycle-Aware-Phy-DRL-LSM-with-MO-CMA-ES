@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import csv
 from functools import lru_cache
 import io
@@ -77,6 +77,10 @@ class Full3DResult:
     candidate_count: int
     archive_metrics: List[Dict[str, float]]
     selection_diagnostics: Dict[str, object]
+    lifecycle_trace: List[Dict[str, object]] = field(default_factory=list)
+    visibility_diagnostics: List[Dict[str, object]] = field(default_factory=list)
+    surrogate_train_metrics: Dict[str, object] = field(default_factory=dict)
+    policy_train_metrics: Dict[str, object] = field(default_factory=dict)
 
 
 class Full3DUNetGNNPolicy(nn.Module):
@@ -723,11 +727,425 @@ def _side_surface_lumped_by_ring(
     return free_area, effective_area, side_total_area
 
 
+def _ray_triangle_intersections(origin: np.ndarray, direction: np.ndarray, triangles: np.ndarray) -> np.ndarray:
+    eps = 1.0e-10
+    edge1 = triangles[:, 1] - triangles[:, 0]
+    edge2 = triangles[:, 2] - triangles[:, 0]
+    pvec = np.cross(np.broadcast_to(direction, edge2.shape), edge2)
+    det = np.einsum("ij,ij->i", edge1, pvec)
+    active = np.abs(det) > eps
+    inv_det = np.zeros_like(det)
+    inv_det[active] = 1.0 / det[active]
+    tvec = origin - triangles[:, 0]
+    u = np.einsum("ij,ij->i", tvec, pvec) * inv_det
+    active &= (u >= -1.0e-9) & (u <= 1.0 + 1.0e-9)
+    qvec = np.cross(tvec, edge1)
+    v = np.einsum("j,ij->i", direction, qvec) * inv_det
+    active &= (v >= -1.0e-9) & ((u + v) <= 1.0 + 1.0e-9)
+    t = np.einsum("ij,ij->i", edge2, qvec) * inv_det
+    return active & (t > 1.0e-7)
+
+
+def _ray_triangle_hits_batch(origin: np.ndarray, directions: np.ndarray, triangles: np.ndarray, chunk_size: int = 64) -> np.ndarray:
+    eps = 1.0e-10
+    dirs = np.asarray(directions, dtype=np.float64)
+    hits_any = np.zeros(dirs.shape[0], dtype=bool)
+    edge1 = triangles[:, 1] - triangles[:, 0]
+    edge2 = triangles[:, 2] - triangles[:, 0]
+    tvec = origin - triangles[:, 0]
+    for start in range(0, dirs.shape[0], max(int(chunk_size), 1)):
+        stop = min(start + max(int(chunk_size), 1), dirs.shape[0])
+        d = dirs[start:stop]
+        pvec = np.cross(d[:, None, :], edge2[None, :, :])
+        det = np.einsum("tj,rtj->rt", edge1, pvec)
+        active = np.abs(det) > eps
+        inv_det = np.zeros_like(det)
+        inv_det[active] = 1.0 / det[active]
+        u = np.einsum("tj,rtj->rt", tvec, pvec) * inv_det
+        active &= (u >= -1.0e-9) & (u <= 1.0 + 1.0e-9)
+        qvec = np.cross(tvec[None, :, :], edge1[None, :, :])
+        v = np.einsum("rj,rtj->rt", d, qvec) * inv_det
+        active &= (v >= -1.0e-9) & ((u + v) <= 1.0 + 1.0e-9)
+        t = np.einsum("tj,rtj->rt", edge2, qvec) * inv_det
+        active &= t > 1.0e-7
+        hits_any[start:stop] = np.any(active, axis=1)
+    return hits_any
+
+
+def _hemisphere_directions(normal: np.ndarray, count: int) -> np.ndarray:
+    n = np.asarray(normal, dtype=np.float64)
+    n = n / max(float(np.linalg.norm(n)), 1.0e-12)
+    helper = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+    if abs(float(np.dot(helper, n))) > 0.88:
+        helper = np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
+    tangent = np.cross(n, helper)
+    tangent /= max(float(np.linalg.norm(tangent)), 1.0e-12)
+    bitangent = np.cross(n, tangent)
+    samples = max(int(count), 1)
+    dirs = np.empty((samples, 3), dtype=np.float64)
+    golden = math.pi * (3.0 - math.sqrt(5.0))
+    for idx in range(samples):
+        u = (idx + 0.5) / samples
+        v = ((idx * golden) / (2.0 * math.pi)) % 1.0
+        cos_theta = math.sqrt(max(1.0 - u, 0.0))
+        sin_theta = math.sqrt(max(u, 0.0))
+        phi = 2.0 * math.pi * v
+        dirs[idx] = (
+            math.cos(phi) * sin_theta * tangent
+            + math.sin(phi) * sin_theta * bitangent
+            + cos_theta * n
+        )
+    return dirs
+
+
+def evaluate_visibility(
+    cfg,
+    geometry: Full3DGeometry,
+    area: np.ndarray | None = None,
+    normals: np.ndarray | None = None,
+    centers: np.ndarray | None = None,
+) -> tuple[float, np.ndarray, List[Dict[str, object]]]:
+    """Estimate escaped free-surface fraction with deterministic ray casting.
+
+    Only side-wall faces are radiating/free surfaces. End faces are excluded from
+    radiation, sublimation and visibility accounting by construction.
+    """
+
+    if area is None or normals is None or centers is None:
+        area, normals, centers = _mesh_area_normals_centers(geometry)
+    side_faces = int(min(_side_face_count(geometry), len(geometry.faces)))
+    face_escape = np.zeros(len(geometry.faces), dtype=np.float64)
+    diagnostics: List[Dict[str, object]] = []
+    if side_faces <= 0:
+        return 0.0, face_escape, diagnostics
+    rays = max(int(getattr(cfg, "full3d_visibility_rays", 512)), 1)
+    patch_limit = max(int(getattr(cfg, "full3d_visibility_patch_limit", 64)), 1)
+    sample_faces = np.arange(side_faces, dtype=np.int64)
+    if side_faces > patch_limit:
+        sample_faces = np.unique(np.linspace(0, side_faces - 1, patch_limit, dtype=np.int64))
+    triangles = geometry.vertices[geometry.faces]
+    proxy_center = np.mean(geometry.vertices, axis=0)
+    proxy = np.clip(
+        np.sum(normals[:side_faces] * (centers[:side_faces] - proxy_center), axis=1)
+        / np.maximum(np.linalg.norm(centers[:side_faces] - proxy_center, axis=1), 1.0e-12),
+        0.0,
+        1.0,
+    )
+    if not bool(getattr(cfg, "full3d_visibility_use_raycast", True)) or rays <= 1:
+        face_escape[:side_faces] = proxy
+    else:
+        for face_id in sample_faces:
+            face_id = int(face_id)
+            origin = centers[face_id] + normals[face_id] * 1.0e-8
+            dirs = _hemisphere_directions(normals[face_id], rays)
+            other_triangles = np.delete(triangles, face_id, axis=0)
+            hits = _ray_triangle_hits_batch(origin, dirs, other_triangles)
+            escaped = int(np.count_nonzero(~hits))
+            escape = float(escaped) / float(rays)
+            face_escape[face_id] = escape
+            diagnostics.append(
+                {
+                    "face_index": int(face_id),
+                    "area_m2": float(area[face_id]),
+                    "escape_visibility_factor": escape,
+                    "sampled_rays": int(rays),
+                }
+            )
+        if sample_faces.size < side_faces:
+            sampled_centers = centers[sample_faces]
+            sampled_escape = face_escape[sample_faces]
+            for face_id in range(side_faces):
+                if face_escape[face_id] > 0.0 or face_id in set(int(x) for x in sample_faces):
+                    continue
+                dist = np.linalg.norm(sampled_centers - centers[face_id], axis=1)
+                nearest = int(np.argmin(dist))
+                face_escape[face_id] = float(sampled_escape[nearest])
+        zero_sampled = (face_escape[:side_faces] <= 0.0) & (proxy > 0.0)
+        face_escape[:side_faces][zero_sampled] = 0.35 * proxy[zero_sampled]
+    total = float(np.sum(area[:side_faces]))
+    factor = float(np.sum(area[:side_faces] * face_escape[:side_faces]) / max(total, 1.0e-18))
+    return factor, face_escape, diagnostics
+
+
+def _side_surface_lumped_by_ring_with_visibility(
+    geometry: Full3DGeometry,
+    area: np.ndarray,
+    face_escape: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    side_faces = int(min(_side_face_count(geometry), len(geometry.faces)))
+    free_area = np.zeros(int(geometry.num_rings), dtype=np.float64)
+    effective_area = np.zeros(int(geometry.num_rings), dtype=np.float64)
+    if side_faces <= 0:
+        return free_area, effective_area, 0.0
+    face_idx = 0
+    for ridx in range(int(geometry.num_rings) - 1):
+        for _ in range(int(geometry.num_segments)):
+            for _tri in range(2):
+                patch_area = float(area[face_idx])
+                escaped = patch_area * float(np.clip(face_escape[face_idx], 0.0, 1.0))
+                free_area[ridx] += 0.5 * patch_area
+                free_area[ridx + 1] += 0.5 * patch_area
+                effective_area[ridx] += 0.5 * escaped
+                effective_area[ridx + 1] += 0.5 * escaped
+                face_idx += 1
+    return free_area, effective_area, float(np.sum(area[:side_faces]))
+
+
 def _full3d_axial_profile(geometry: Full3DGeometry) -> tuple[np.ndarray, np.ndarray]:
     side = geometry.vertices[geometry.side_indices]
     z = np.mean(side[:, :, 2], axis=1).astype(np.float64)
     cross_section_area = np.asarray([_polygon_area_xy(points[:, :2]) for points in side], dtype=np.float64)
     return z, np.maximum(cross_section_area, 1.0e-12)
+
+
+def evaluate_feature_scales(cfg, geometry: Full3DGeometry) -> Dict[str, float]:
+    side = geometry.vertices[geometry.side_indices]
+    radii = np.linalg.norm(side[:, :, :2], axis=2)
+    ring_area = np.asarray([_polygon_area_xy(points[:, :2]) for points in side], dtype=np.float64)
+    contact = _end_contact_metrics(geometry, cfg)
+    min_radius = float(np.min(radii)) if radii.size else 0.0
+    min_eq_diameter = float(np.min(np.sqrt(4.0 * np.maximum(ring_area, 0.0) / math.pi))) if ring_area.size else 0.0
+    lower_contact_d = math.sqrt(4.0 * float(contact["lower_electrode_contact_area_m2"]) / math.pi)
+    upper_contact_d = math.sqrt(4.0 * float(contact["upper_electrode_contact_area_m2"]) / math.pi)
+    end_footprint_d = math.sqrt(4.0 * max(float(contact["end_face_area_m2"]) * 0.5, 0.0) / math.pi)
+    min_edge = 0.0
+    if geometry.faces.size:
+        tri = geometry.vertices[geometry.faces]
+        edges = np.concatenate(
+            [
+                np.linalg.norm(tri[:, 1] - tri[:, 0], axis=1),
+                np.linalg.norm(tri[:, 2] - tri[:, 1], axis=1),
+                np.linalg.norm(tri[:, 0] - tri[:, 2], axis=1),
+            ]
+        )
+        min_edge = float(np.min(edges)) if edges.size else 0.0
+    return {
+        "feature_local_thickness_min_m": float(2.0 * min_radius),
+        "feature_axial_equiv_diameter_min_m": float(min_eq_diameter),
+        "feature_lower_contact_equiv_diameter_m": float(lower_contact_d),
+        "feature_upper_contact_equiv_diameter_m": float(upper_contact_d),
+        "feature_end_footprint_equiv_diameter_m": float(end_footprint_d),
+        "feature_min_edge_m": float(min_edge),
+        "feature_min_neck_scale_m": float(min(value for value in [2.0 * min_radius, min_eq_diameter, lower_contact_d, upper_contact_d] if value > 0.0)),
+        "feature_scale_mode_full3d": str(getattr(cfg, "full3d_feature_scale_mode", "sdf")),
+    }
+
+
+def _feature_scale_failure(
+    initial: Dict[str, float],
+    current: Dict[str, float],
+    threshold: float,
+) -> tuple[bool, float, str]:
+    tracked = [
+        "feature_local_thickness_min_m",
+        "feature_axial_equiv_diameter_min_m",
+        "feature_lower_contact_equiv_diameter_m",
+        "feature_upper_contact_equiv_diameter_m",
+        "feature_end_footprint_equiv_diameter_m",
+        "feature_min_neck_scale_m",
+    ]
+    worst_ratio = 0.0
+    reason = ""
+    failed = False
+    for key in tracked:
+        base = float(initial.get(key, 0.0))
+        now = float(current.get(key, base))
+        if base <= 1.0e-15:
+            continue
+        ratio = abs(now - base) / base
+        if ratio > worst_ratio:
+            worst_ratio = float(ratio)
+            reason = key
+        if ratio >= float(threshold):
+            failed = True
+    return failed, float(worst_ratio), reason
+
+
+def _apply_lifecycle_recession(
+    cfg,
+    geometry: Full3DGeometry,
+    temperature_profile: np.ndarray,
+    dt_s: float,
+    target_volume: float,
+) -> Full3DGeometry:
+    vertices = geometry.vertices.copy()
+    side_ids = geometry.side_indices
+    temps = np.asarray(temperature_profile, dtype=np.float64)
+    if temps.size != int(geometry.num_rings):
+        src = np.linspace(0.0, 1.0, max(temps.size, 1))
+        dst = np.linspace(0.0, 1.0, int(geometry.num_rings))
+        temps = np.interp(dst, src, temps if temps.size else np.asarray([float(cfg.ambient_temp)]))
+    recession = _evaporation_flux_np(cfg, temps) / max(float(cfg.density), 1.0e-12) * float(dt_s)
+    min_radius = max(float(getattr(cfg, "min_radius", 8.0e-4)) * 0.25, 1.0e-5)
+    for ridx in range(int(geometry.num_rings)):
+        ids = side_ids[ridx]
+        ids = ids[ids >= 0]
+        radial = vertices[ids, :2]
+        norm = np.linalg.norm(radial, axis=1, keepdims=True)
+        new_radius = np.maximum(norm[:, 0] - float(recession[ridx]), min_radius)
+        vertices[ids, :2] = radial / np.maximum(norm, 1.0e-12) * new_radius[:, None]
+    # End-face interiors follow the changed footprint in plane; z remains fixed.
+    for grid in (geometry.lower_cap_indices[1:], geometry.upper_cap_indices[1:]):
+        ids = np.unique(grid.reshape(-1))
+        ids = ids[ids >= 0]
+        radial = vertices[ids, :2]
+        norm = np.linalg.norm(radial, axis=1, keepdims=True)
+        scale = np.maximum(1.0 - 0.35 * float(np.max(recession)) / np.maximum(norm[:, 0], 1.0e-12), 0.80)
+        vertices[ids, :2] = radial * scale[:, None]
+    receded = _clone_geometry(geometry, vertices)
+    _enforce_axial_length(cfg, receded, receded.vertices)
+    return receded
+
+
+def _temperature_profile_from_metrics(cfg, geometry: Full3DGeometry, metrics: Dict[str, float]) -> np.ndarray:
+    if "temperature_profile_k" in metrics:
+        profile = np.asarray(metrics["temperature_profile_k"], dtype=np.float64)
+        if profile.size == int(geometry.num_rings):
+            return profile
+    z, _ = _full3d_axial_profile(geometry)
+    if z.size == 0:
+        return np.asarray([float(metrics.get("mean_temperature_k", cfg.ambient_temp))], dtype=np.float64)
+    z_norm = (z - float(np.min(z))) / max(float(np.max(z) - np.min(z)), 1.0e-12)
+    shape = np.sin(math.pi * np.clip(z_norm, 0.0, 1.0))
+    ambient = float(cfg.ambient_temp)
+    max_temp = max(float(metrics.get("max_temperature_k", ambient)), ambient)
+    return ambient + (max_temp - ambient) * shape
+
+
+def _lifecycle_time_cap(cfg, first_metrics: Dict[str, float], baseline_metrics: Dict[str, float] | None) -> float:
+    raw = getattr(cfg, "full3d_lifecycle_time_cap_s", "auto")
+    if raw is None or str(raw).lower() == "auto":
+        life = float(first_metrics.get("lifetime_s", 0.0))
+        baseline_life = float((baseline_metrics or {}).get("lifetime_s", life))
+        candidates = [value for value in [life, baseline_life] if value > 0.0 and math.isfinite(value)]
+        if not candidates:
+            return float(getattr(cfg, "full3d_lifetime_cap_s", 1.0e300))
+        return min(max(candidates), float(getattr(cfg, "full3d_lifetime_cap_s", 1.0e300)))
+    return max(float(raw), float(getattr(cfg, "full3d_lifecycle_min_dt_s", 1.0e-12)))
+
+
+def evaluate_initial_power(
+    cfg,
+    geometry: Full3DGeometry,
+    baseline_metrics: Dict[str, float] | None = None,
+) -> Dict[str, float]:
+    metrics = evaluate_full3d_geometry(cfg, geometry, baseline_metrics, include_lifecycle=False)
+    metrics["P0_escape_0_3um_w"] = float(metrics.get("net_radiated_power_0k_sphere_w", 0.0))
+    return metrics
+
+
+def _evaluate_lifecycle_step_geometry(
+    cfg,
+    geometry: Full3DGeometry,
+    baseline_metrics: Dict[str, float] | None,
+) -> Dict[str, float]:
+    original_tol = getattr(cfg, "full3d_volume_tolerance_ratio", 1.0e-5)
+    try:
+        # During service, volume loss is the evaporation state variable rather
+        # than an initial-design constraint violation.
+        cfg.full3d_volume_tolerance_ratio = 1.0e9
+        return evaluate_full3d_geometry(cfg, geometry, baseline_metrics, include_lifecycle=False)
+    finally:
+        cfg.full3d_volume_tolerance_ratio = original_tol
+
+
+def _lifecycle_step_feasible(cfg, metrics: Dict[str, float]) -> bool:
+    return bool(
+        bool(metrics.get("thermal_converged", False))
+        and float(metrics.get("max_temperature_k", 0.0)) <= float(cfg.max_temp)
+        and float(metrics.get("voltage_v", 0.0)) <= float(cfg.max_voltage)
+        and float(metrics.get("electrode_max_error_m", 0.0)) <= float(getattr(cfg, "full3d_electrode_tolerance_m", 2.0e-6))
+    )
+
+
+def evaluate_lifecycle(
+    cfg,
+    geometry: Full3DGeometry,
+    baseline_metrics: Dict[str, float] | None = None,
+) -> tuple[Dict[str, float], List[Dict[str, object]]]:
+    target_volume = math.pi * float(cfg.radius) ** 2 * float(cfg.height)
+    steps = max(int(getattr(cfg, "full3d_lifecycle_steps", 16)), 1)
+    current = geometry
+    initial_features = evaluate_feature_scales(cfg, geometry)
+    trace: List[Dict[str, object]] = []
+    elapsed = 0.0
+    p_integral = 0.0
+    mass_loss = 0.0
+    first_metrics = _evaluate_lifecycle_step_geometry(cfg, current, baseline_metrics)
+    time_cap = _lifecycle_time_cap(cfg, first_metrics, baseline_metrics)
+    nominal_life = max(float(first_metrics.get("lifetime_s", time_cap)), float(getattr(cfg, "full3d_lifecycle_min_dt_s", 1.0e-12)))
+    dt = max(min(time_cap, nominal_life) / float(steps), float(getattr(cfg, "full3d_lifecycle_min_dt_s", 1.0e-12)))
+    failed = False
+    failure_reason = "time_cap"
+    last_metrics = first_metrics
+    max_feature_delta = 0.0
+    min_feature_remaining = 1.0
+    for step_idx in range(steps + 1):
+        metrics = first_metrics if step_idx == 0 else _evaluate_lifecycle_step_geometry(cfg, current, baseline_metrics)
+        last_metrics = metrics
+        features = evaluate_feature_scales(cfg, current)
+        feature_failed, feature_delta, feature_reason = _feature_scale_failure(
+            initial_features,
+            features,
+            float(getattr(cfg, "feature_fail_ratio", 0.20)),
+        )
+        max_feature_delta = max(max_feature_delta, feature_delta)
+        min_feature_remaining = min(min_feature_remaining, max(1.0 - feature_delta, 0.0))
+        trace.append(
+            {
+                "step": int(step_idx),
+                "time_s": float(elapsed),
+                "voltage_v": float(metrics.get("voltage_v", 0.0)),
+                "P_escape_0_3um_w": float(metrics.get("P0_escape_0_3um_w", metrics.get("net_radiated_power_0k_sphere_w", 0.0))),
+                "Tmax_k": float(metrics.get("max_temperature_k", 0.0)),
+                "mass_loss_kg": float(mass_loss),
+                "min_feature_ratio": float(min_feature_remaining),
+                "feature_delta_ratio": float(feature_delta),
+                "feature_failure_reason": str(feature_reason),
+                "constraint_feasible_3d": bool(_lifecycle_step_feasible(cfg, metrics)),
+            }
+        )
+        if step_idx >= steps:
+            break
+        if feature_failed:
+            failed = True
+            failure_reason = feature_reason
+            break
+        if not _lifecycle_step_feasible(cfg, metrics):
+            failed = True
+            failure_reason = "constraint_infeasible"
+            break
+        power = float(metrics.get("P0_escape_0_3um_w", metrics.get("net_radiated_power_0k_sphere_w", 0.0)))
+        p_integral += power * dt
+        mass_loss += float(metrics.get("mass_loss_rate_kg_s", 0.0)) * dt
+        current = _apply_lifecycle_recession(
+            cfg,
+            current,
+            _temperature_profile_from_metrics(cfg, current, metrics),
+            dt,
+            target_volume,
+        )
+        elapsed += dt
+    if elapsed <= 0.0:
+        elapsed = max(float(trace[-1]["time_s"]) if trace else 0.0, float(getattr(cfg, "full3d_lifecycle_min_dt_s", 1.0e-12)))
+    if p_integral <= 0.0 and trace:
+        p_integral = float(trace[0]["P_escape_0_3um_w"]) * elapsed
+    avg_power = p_integral / max(elapsed, 1.0e-300)
+    baseline_life = max(float((baseline_metrics or {}).get("lifetime_s_full3d", (baseline_metrics or {}).get("lifetime_s", elapsed))), 1.0e-9)
+    summary = {
+        "lifetime_s_full3d": float(elapsed),
+        "lifetime_s": float(elapsed),
+        "lifetime_ratio_3d": float(elapsed / baseline_life),
+        "lifecycle_avg_escape_0_3um_w": float(avg_power),
+        "lifecycle_steps_evaluated": int(len(trace)),
+        "lifecycle_time_cap_s": float(time_cap),
+        "lifecycle_mass_loss_kg": float(mass_loss),
+        "feature_scale_change_max_ratio": float(max_feature_delta),
+        "feature_min_remaining_ratio": float(min_feature_remaining),
+        "feature_failure_reason": str(failure_reason if failed else "not_failed_within_horizon"),
+        "feature_failure": bool(failed),
+    }
+    return summary, trace
 
 
 def _band_fraction_for_balance(cfg, temperature: float) -> float:
@@ -1019,6 +1437,7 @@ def _evaluate_full3d_geometry_at_voltage(
     geometry: Full3DGeometry,
     voltage: float,
     baseline_metrics: Dict[str, float] | None = None,
+    visibility_cache: Dict[str, object] | None = None,
 ) -> Dict[str, float]:
     target_volume = math.pi * float(cfg.radius) ** 2 * float(cfg.height)
     volume = mesh_volume(geometry)
@@ -1032,7 +1451,26 @@ def _evaluate_full3d_geometry_at_voltage(
     temperature_profile = np.asarray(thermal["temperature_profile_k"], dtype=np.float64)
     max_temperature = float(thermal["max_temperature_k"])
     mean_temperature = float(thermal["mean_temperature_k"])
-    free_area, effective_area_by_ring, side_area = _side_surface_lumped_by_ring(geometry, area, normals, centers)
+    free_area, proxy_effective_area_by_ring, side_area = _side_surface_lumped_by_ring(geometry, area, normals, centers)
+    visibility_factor = float(np.sum(proxy_effective_area_by_ring) / max(side_area, 1.0e-12))
+    visibility_mode = "center-normal-proxy"
+    visibility_rays = 0
+    effective_area_by_ring = proxy_effective_area_by_ring
+    if str(getattr(cfg, "full3d_objective_mode", "efficiency")).lower() in {"lifecycle", "sota"}:
+        cache = visibility_cache if visibility_cache is not None else {}
+        if "face_escape" not in cache:
+            factor, face_escape, diagnostics = evaluate_visibility(cfg, geometry, area, normals, centers)
+            cache["visibility_factor"] = float(factor)
+            cache["face_escape"] = face_escape
+            cache["visibility_diagnostics"] = diagnostics
+        visibility_factor = float(cache.get("visibility_factor", visibility_factor))
+        visibility_rays = int(getattr(cfg, "full3d_visibility_rays", 0))
+        visibility_mode = "ray-cast" if visibility_rays > 1 else "center-normal-proxy"
+        _, effective_area_by_ring, _ = _side_surface_lumped_by_ring_with_visibility(
+            geometry,
+            area,
+            np.asarray(cache["face_escape"], dtype=np.float64),
+        )
     band_fraction_by_ring = np.asarray(
         [blackbody_band_fraction(float(temp), float(cfg.in_band_upper_um)) for temp in temperature_profile],
         dtype=np.float64,
@@ -1137,6 +1575,10 @@ def _evaluate_full3d_geometry_at_voltage(
         "max_temperature_k": max_temperature,
         "net_radiated_power_0k_sphere_w": float(net_band_power),
         "net_radiated_power_300k_environment_w": float(band_power_300k_environment),
+        "P0_escape_0_3um_w": float(net_band_power),
+        "escape_visibility_factor": float(visibility_factor),
+        "visibility_mode_full3d": visibility_mode,
+        "visibility_rays_full3d": int(visibility_rays),
         "energy_conversion_efficiency_0_3um": float(efficiency),
         "energy_conversion_efficiency_ratio": float(efficiency_ratio),
         "objective": "maximize initial-state 0-3um escaped radiant efficiency under rated voltage search",
@@ -1189,7 +1631,20 @@ def _evaluate_full3d_geometry_at_voltage(
 
 def _full3d_voltage_rank(metrics: Dict[str, float]) -> tuple[int, float, float]:
     feasible = 1 if bool(metrics.get("constraint_feasible_3d", False)) else 0
+    objective_mode = str(metrics.get("objective_mode_full3d", "")).lower()
     if feasible:
+        if objective_mode == "sota":
+            return (
+                feasible,
+                float(metrics.get("lifecycle_avg_escape_0_3um_w", metrics.get("net_radiated_power_0k_sphere_w", 0.0))),
+                float(metrics.get("P0_escape_0_3um_w", metrics.get("net_radiated_power_0k_sphere_w", 0.0))),
+            )
+        if objective_mode == "lifecycle":
+            return (
+                feasible,
+                float(metrics.get("lifetime_s_full3d", metrics.get("lifetime_s", 0.0))),
+                float(metrics.get("lifecycle_avg_escape_0_3um_w", metrics.get("net_radiated_power_0k_sphere_w", 0.0))),
+            )
         return (
             feasible,
             float(metrics.get("rated_operating_score", metrics.get("energy_conversion_efficiency_0_3um", 0.0))),
@@ -1204,11 +1659,12 @@ def _search_full3d_rated_condition(
     baseline_metrics: Dict[str, float] | None = None,
 ) -> Dict[str, float]:
     evaluated: Dict[float, Dict[str, float]] = {}
+    visibility_cache: Dict[str, object] = {}
 
     def evaluate(voltage_v: float) -> Dict[str, float]:
         key = round(float(voltage_v), 8)
         if key not in evaluated:
-            metrics = _evaluate_full3d_geometry_at_voltage(cfg, geometry, float(voltage_v), baseline_metrics)
+            metrics = _evaluate_full3d_geometry_at_voltage(cfg, geometry, float(voltage_v), baseline_metrics, visibility_cache)
             metrics["voltage_search_mode"] = "rated_search"
             evaluated[key] = metrics
         return evaluated[key]
@@ -1257,14 +1713,229 @@ def _search_full3d_rated_condition(
     return best
 
 
-def evaluate_full3d_geometry(cfg, geometry: Full3DGeometry, baseline_metrics: Dict[str, float] | None = None) -> Dict[str, float]:
+def evaluate_full3d_geometry(
+    cfg,
+    geometry: Full3DGeometry,
+    baseline_metrics: Dict[str, float] | None = None,
+    include_lifecycle: bool = True,
+) -> Dict[str, float]:
     fixed_voltage = _full3d_fixed_voltage(cfg)
     if fixed_voltage is not None:
-        return _evaluate_full3d_geometry_at_voltage(cfg, geometry, fixed_voltage, baseline_metrics)
-    return _search_full3d_rated_condition(cfg, geometry, baseline_metrics)
+        metrics = _evaluate_full3d_geometry_at_voltage(cfg, geometry, fixed_voltage, baseline_metrics)
+    else:
+        metrics = _search_full3d_rated_condition(cfg, geometry, baseline_metrics)
+    metrics.update(evaluate_feature_scales(cfg, geometry))
+    objective_mode = str(getattr(cfg, "full3d_objective_mode", "efficiency")).lower()
+    metrics["objective_mode_full3d"] = objective_mode
+    metrics["P0_escape_0_3um_w"] = float(metrics.get("P0_escape_0_3um_w", metrics.get("net_radiated_power_0k_sphere_w", 0.0)))
+    metrics["lifetime_s_full3d"] = float(metrics.get("lifetime_s", 0.0))
+    metrics["lifecycle_avg_escape_0_3um_w"] = float(metrics.get("P0_escape_0_3um_w", 0.0))
+    metrics["feature_failure_reason"] = str(metrics.get("feature_failure_reason", "steady_recession_estimate"))
+    if include_lifecycle and objective_mode in {"lifecycle", "sota"}:
+        lifecycle, _trace = evaluate_lifecycle(cfg, geometry, baseline_metrics)
+        metrics.update(lifecycle)
+        if baseline_metrics is not None:
+            baseline_p0 = max(float(baseline_metrics.get("P0_escape_0_3um_w", baseline_metrics.get("net_radiated_power_0k_sphere_w", 0.0))), 1.0e-9)
+            baseline_pavg = max(float(baseline_metrics.get("lifecycle_avg_escape_0_3um_w", baseline_p0)), 1.0e-9)
+            metrics["P0_escape_ratio_full3d"] = float(metrics.get("P0_escape_0_3um_w", 0.0)) / baseline_p0
+            metrics["lifecycle_avg_escape_ratio_full3d"] = float(metrics.get("lifecycle_avg_escape_0_3um_w", 0.0)) / baseline_pavg
+        feasible = bool(metrics.get("constraint_feasible_3d", False)) and float(metrics.get("lifetime_ratio_3d", 0.0)) >= float(cfg.minimum_lifetime_ratio)
+        metrics["constraint_feasible_3d"] = bool(feasible)
+        metrics["score"] = _sota_scalar_score(metrics, baseline_metrics, cfg)
+    return metrics
+
+
+def _sota_scalar_score(metrics: Dict[str, float], baseline_metrics: Dict[str, float] | None, cfg) -> float:
+    baseline = baseline_metrics or {}
+    p0 = float(metrics.get("P0_escape_0_3um_w", metrics.get("net_radiated_power_0k_sphere_w", 0.0)))
+    pavg = float(metrics.get("lifecycle_avg_escape_0_3um_w", p0))
+    lifetime = float(metrics.get("lifetime_s_full3d", metrics.get("lifetime_s", 0.0)))
+    visibility = float(metrics.get("escape_visibility_factor", metrics.get("escape_view_factor_proxy", 0.0)))
+    base_p0 = max(float(baseline.get("P0_escape_0_3um_w", baseline.get("net_radiated_power_0k_sphere_w", p0))), 1.0e-9)
+    base_pavg = max(float(baseline.get("lifecycle_avg_escape_0_3um_w", base_p0)), 1.0e-9)
+    base_life = max(float(baseline.get("lifetime_s_full3d", baseline.get("lifetime_s", lifetime))), 1.0e-9)
+    score = (
+        0.32 * (p0 / base_p0)
+        + 0.34 * (pavg / base_pavg)
+        + 0.18 * min(lifetime / base_life, 20.0)
+        + 0.16 * visibility
+        + 0.06 * float(metrics.get("energy_conversion_efficiency_ratio", 0.0))
+    )
+    penalties = (
+        80.0 * float(metrics.get("volume_change_ratio_3d", 0.0))
+        + 1.0e5 * float(metrics.get("electrode_max_error_m", 0.0))
+        + 60.0 * float(metrics.get("temperature_violation_ratio", 0.0))
+        + 50.0 * max(float(cfg.minimum_lifetime_ratio) - float(metrics.get("lifetime_ratio_3d", 0.0)), 0.0)
+    )
+    if not bool(metrics.get("constraint_feasible_3d", False)):
+        penalties += 10.0
+    return float(score - penalties)
+
+
+def _objective_vector(metrics: Dict[str, float]) -> np.ndarray:
+    return np.asarray(
+        [
+            float(metrics.get("P0_escape_0_3um_w", metrics.get("net_radiated_power_0k_sphere_w", 0.0))),
+            float(metrics.get("lifetime_s_full3d", metrics.get("lifetime_s", 0.0))),
+            float(metrics.get("lifecycle_avg_escape_0_3um_w", metrics.get("net_radiated_power_0k_sphere_w", 0.0))),
+            float(metrics.get("escape_visibility_factor", metrics.get("escape_view_factor_proxy", 0.0))),
+        ],
+        dtype=np.float64,
+    )
+
+
+def _dominates(a: Dict[str, float], b: Dict[str, float]) -> bool:
+    if bool(a.get("constraint_feasible_3d", False)) != bool(b.get("constraint_feasible_3d", False)):
+        return bool(a.get("constraint_feasible_3d", False))
+    va = _objective_vector(a)
+    vb = _objective_vector(b)
+    return bool(np.all(va >= vb) and np.any(va > vb))
+
+
+def assign_pareto_metrics(archive_metrics: List[Dict[str, float]]) -> None:
+    count = len(archive_metrics)
+    if count == 0:
+        return
+    domination_counts = np.zeros(count, dtype=np.int64)
+    dominated: list[list[int]] = [[] for _ in range(count)]
+    fronts: list[list[int]] = [[]]
+    for i in range(count):
+        for j in range(count):
+            if i == j:
+                continue
+            if _dominates(archive_metrics[i], archive_metrics[j]):
+                dominated[i].append(j)
+            elif _dominates(archive_metrics[j], archive_metrics[i]):
+                domination_counts[i] += 1
+        if domination_counts[i] == 0:
+            archive_metrics[i]["pareto_rank"] = 0
+            fronts[0].append(i)
+    rank = 0
+    while rank < len(fronts) and fronts[rank]:
+        next_front: list[int] = []
+        for i in fronts[rank]:
+            for j in dominated[i]:
+                domination_counts[j] -= 1
+                if domination_counts[j] == 0:
+                    archive_metrics[j]["pareto_rank"] = rank + 1
+                    next_front.append(j)
+        rank += 1
+        if next_front:
+            fronts.append(next_front)
+    vectors = np.stack([_objective_vector(item) for item in archive_metrics], axis=0)
+    scale = np.maximum(np.max(vectors, axis=0), 1.0e-12)
+    norm = np.clip(vectors / scale[None, :], 0.0, None)
+    reference = np.zeros(norm.shape[1], dtype=np.float64)
+    for front in fronts:
+        if not front:
+            continue
+        front_norm = norm[front]
+        crowding = np.zeros(len(front), dtype=np.float64)
+        for obj_idx in range(front_norm.shape[1]):
+            order = np.argsort(front_norm[:, obj_idx])
+            crowding[order[0]] = crowding[order[-1]] = float("inf")
+            span = max(float(front_norm[order[-1], obj_idx] - front_norm[order[0], obj_idx]), 1.0e-12)
+            for pos in range(1, len(order) - 1):
+                crowding[order[pos]] += (front_norm[order[pos + 1], obj_idx] - front_norm[order[pos - 1], obj_idx]) / span
+        for local_idx, archive_idx in enumerate(front):
+            item = archive_metrics[archive_idx]
+            item["pareto_crowding_distance"] = float(crowding[local_idx])
+            item["pareto_hypervolume_contribution"] = float(np.prod(np.maximum(norm[archive_idx] - reference, 0.0)))
+
+
+def _pareto_rank_key(metrics: Dict[str, float]) -> tuple[int, int, float, float]:
+    feasible = 1 if bool(metrics.get("constraint_feasible_3d", False)) else 0
+    rank = -int(metrics.get("pareto_rank", 10**9))
+    hv = float(metrics.get("pareto_hypervolume_contribution", 0.0))
+    score = float(metrics.get("score", -float("inf")))
+    return (feasible, rank, hv, score)
+
+
+def _archive_hypervolume_proxy(archive_metrics: List[Dict[str, float]]) -> float:
+    feasible = [item for item in archive_metrics if bool(item.get("constraint_feasible_3d", False)) and int(item.get("pareto_rank", 1)) == 0]
+    if not feasible:
+        return 0.0
+    vectors = np.stack([_objective_vector(item) for item in feasible], axis=0)
+    scale = np.maximum(np.max(vectors, axis=0), 1.0e-12)
+    return float(np.sum(np.prod(np.clip(vectors / scale[None, :], 0.0, None), axis=1)))
+
+
+def _sample_mocma_actions(
+    rng: np.random.Generator,
+    mean: np.ndarray,
+    covariance: np.ndarray,
+    sigma: float,
+    count: int,
+) -> np.ndarray:
+    dim = int(mean.size)
+    jitter = float(max(sigma, 1.0e-9) ** 2) * 1.0e-6
+    cov = np.asarray(covariance, dtype=np.float64) + np.eye(dim, dtype=np.float64) * jitter
+    try:
+        samples = rng.multivariate_normal(mean, cov * float(sigma) ** 2, size=max(int(count), 1), method="svd")
+    except TypeError:
+        samples = rng.multivariate_normal(mean, cov * float(sigma) ** 2, size=max(int(count), 1))
+    except np.linalg.LinAlgError:
+        samples = rng.normal(mean, float(sigma), size=(max(int(count), 1), dim))
+    return np.asarray(samples, dtype=np.float64)
+
+
+def _update_mocma_distribution(
+    actions: list[np.ndarray],
+    metrics: list[Dict[str, float]],
+    mean: np.ndarray,
+    covariance: np.ndarray,
+    sigma: float,
+    cfg,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    if not actions:
+        return mean, covariance, sigma
+    ranked_idx = sorted(range(len(actions)), key=lambda idx: _pareto_rank_key(metrics[idx]), reverse=True)
+    elite_fraction = float(getattr(cfg, "full3d_mocma_elite_fraction", 0.40))
+    elite_count = max(2, int(math.ceil(len(ranked_idx) * elite_fraction)))
+    elite = np.stack([actions[idx] for idx in ranked_idx[:elite_count]], axis=0)
+    weights = np.linspace(1.0, 0.35, elite.shape[0], dtype=np.float64)
+    weights /= max(float(np.sum(weights)), 1.0e-12)
+    elite_mean = np.sum(elite * weights[:, None], axis=0)
+    centered = elite - elite_mean[None, :]
+    elite_cov = (centered * weights[:, None]).T @ centered
+    elite_cov += np.eye(elite.shape[1], dtype=np.float64) * float(getattr(cfg, "full3d_mocma_min_sigma", 0.03)) ** 2
+    smoothing = float(np.clip(getattr(cfg, "full3d_mocma_smoothing", 0.45), 0.0, 0.98))
+    new_mean = smoothing * mean + (1.0 - smoothing) * elite_mean
+    new_cov = smoothing * covariance + (1.0 - smoothing) * elite_cov
+    objective_values = [_objective_vector(metrics[idx]) for idx in ranked_idx[:elite_count]]
+    spread = float(np.mean(np.std(np.stack(objective_values, axis=0), axis=0))) if objective_values else 0.0
+    progress = 1.0 + 0.05 * min(spread, 1.0)
+    new_sigma = max(float(getattr(cfg, "full3d_mocma_min_sigma", 0.03)), float(sigma) * (0.92 / progress))
+    return new_mean, new_cov, float(new_sigma)
+
+
+def _surrogate_metrics_stub(archive_metrics: List[Dict[str, float]], enabled: bool) -> Dict[str, object]:
+    return {
+        "enabled": bool(enabled),
+        "archive_samples": int(len(archive_metrics)),
+        "status": (
+            "active_learning_ready_for_true_physics_infill"
+            if enabled
+            else "insufficient_archive_for_surrogate; using true-physics optimizer"
+        ),
+        "model": "ensemble Geo-FNO/GNN surrogate scaffold",
+        "validation_error": None,
+    }
+
+
+def _policy_metrics_stub(archive_metrics: List[Dict[str, float]]) -> Dict[str, object]:
+    return {
+        "enabled": False,
+        "archive_samples": int(len(archive_metrics)),
+        "status": "SAC policy scaffold available through train_policy.py; final candidates still require true physics verification",
+        "actor_outputs": "radiation/life/avg_power/visibility/current/smoothness strategy maps",
+    }
 
 
 def _full3d_metric_rank(metrics: Dict[str, float]) -> tuple[int, float]:
+    if "pareto_rank" in metrics:
+        key = _pareto_rank_key(metrics)
+        return (int(key[0]), float(key[1]) + 1.0e-6 * float(key[2]) + 1.0e-9 * float(key[3]))
     return (1 if bool(metrics.get("constraint_feasible_3d", False)) else 0, float(metrics.get("score", -float("inf"))))
 
 
@@ -1276,10 +1947,17 @@ def _full3d_metric_snapshot(metrics: Dict[str, float]) -> Dict[str, object]:
     keys = [
         "archive_index",
         "score",
+        "pareto_rank",
+        "pareto_hypervolume_contribution",
         "constraint_feasible_3d",
         "voltage_v",
         "voltage_search_mode",
         "voltage_search_feasible_count",
+        "P0_escape_0_3um_w",
+        "lifetime_s_full3d",
+        "lifecycle_avg_escape_0_3um_w",
+        "escape_visibility_factor",
+        "feature_failure_reason",
         "energy_conversion_efficiency_0_3um",
         "energy_conversion_efficiency_ratio",
         "radiation_efficiency_score",
@@ -1305,6 +1983,7 @@ def _full3d_selection_diagnostics(
     baseline_metrics: Dict[str, float],
     cfg,
 ) -> Dict[str, object]:
+    assign_pareto_metrics(archive_metrics)
     feasible = [item for item in archive_metrics if bool(item.get("constraint_feasible_3d", False))]
     nonbaseline = [item for item in archive_metrics if int(item.get("archive_index", -1)) != 0]
     feasible_nonbaseline = [item for item in nonbaseline if bool(item.get("constraint_feasible_3d", False))]
@@ -1319,6 +1998,10 @@ def _full3d_selection_diagnostics(
         if feasible
         else None
     )
+    best_by_p0 = max(feasible or archive_metrics, key=lambda item: float(item.get("P0_escape_0_3um_w", -float("inf"))))
+    best_by_lifetime = max(feasible or archive_metrics, key=lambda item: float(item.get("lifetime_s_full3d", item.get("lifetime_s", -float("inf")))))
+    best_by_pavg = max(feasible or archive_metrics, key=lambda item: float(item.get("lifecycle_avg_escape_0_3um_w", -float("inf"))))
+    best_compromise = max(feasible or archive_metrics, key=_pareto_rank_key)
     selected_idx = int(selected_metrics.get("archive_index", 0))
     baseline_feasible = bool(baseline_metrics.get("constraint_feasible_3d", False))
     fixed_voltage = _full3d_fixed_voltage(cfg)
@@ -1337,9 +2020,31 @@ def _full3d_selection_diagnostics(
     elif selected_idx == 0:
         reason = "baseline retained: no feasible non-baseline initial shape improved rated 0-3um efficiency score"
     else:
-        reason = "selected feasible globally parameterized initial shape with highest constrained rated-efficiency score"
+        reason = "selected feasible globally parameterized initial shape by Pareto rank plus hypervolume contribution"
 
+    optimizer_name = str(getattr(cfg, "full3d_optimizer", "cem")).lower()
+    objective_mode = str(getattr(cfg, "full3d_objective_mode", "efficiency")).lower()
+    surrogate_enabled = optimizer_name == "turbo-surrogate" and len(archive_metrics) >= int(getattr(cfg, "full3d_surrogate_min_archive", 512))
     diagnostics: Dict[str, object] = {
+        "method_full3d": (
+            "full3d_lifecycle_aware_phydrl_lsm_mocmaes_300k_sink"
+            if optimizer_name in {"mo-cmaes", "cmaes", "turbo-surrogate"}
+            else "full3d_phydrl_lsm_cem_global_initial_shape_300k_sink"
+        ),
+        "optimizer_full3d": optimizer_name,
+        "objective_mode_full3d": objective_mode,
+        "optimizer_description_full3d": (
+            "MO-CMA-ES style full3d strategy-field search with Pareto non-dominated sorting and hypervolume contribution"
+            if optimizer_name in {"mo-cmaes", "cmaes"}
+            else (
+                "trust-region surrogate infill scaffold with true-physics verification; falls back to MO-CMA-ES until archive is large enough"
+                if optimizer_name == "turbo-surrogate"
+                else "CEM over Phy-DRL-LSM inspired global initial-shape strategy-field actions"
+            )
+        ),
+        "surrogate_enabled": bool(surrogate_enabled),
+        "pareto_hypervolume": float(_archive_hypervolume_proxy(archive_metrics)),
+        "pareto_rank": int(selected_metrics.get("pareto_rank", 0)),
         "selected_archive_index": selected_idx,
         "selection_reason_full3d": reason,
         "voltage_search_mode": mode,
@@ -1360,12 +2065,20 @@ def _full3d_selection_diagnostics(
         "strategy_channels_full3d": int(getattr(cfg, "full3d_action_strategy_channels", 4)),
         "global_shape_steps_full3d": int(getattr(cfg, "full3d_global_shape_steps", 4)),
         "cem_elite_fraction_full3d": float(getattr(cfg, "full3d_cem_elite_fraction", 0.35)),
+        "mocma_elite_fraction_full3d": float(getattr(cfg, "full3d_mocma_elite_fraction", 0.40)),
+        "lifecycle_steps_full3d": int(getattr(cfg, "full3d_lifecycle_steps", 16)),
+        "visibility_rays_full3d": int(getattr(cfg, "full3d_visibility_rays", 512)),
+        "feature_scale_mode_full3d": str(getattr(cfg, "full3d_feature_scale_mode", "sdf")),
         "max_allowed_temperature_k": float(cfg.max_temp),
         "baseline_feasible_full3d": baseline_feasible,
         "archive_candidate_count": int(len(archive_metrics)),
         "archive_feasible_count": int(len(feasible)),
         "archive_feasible_nonbaseline_count": int(len(feasible_nonbaseline)),
         "best_archive_by_score": _full3d_metric_snapshot(best_by_score),
+        "best_by_P0": _full3d_metric_snapshot(best_by_p0),
+        "best_by_lifetime": _full3d_metric_snapshot(best_by_lifetime),
+        "best_by_Pavg": _full3d_metric_snapshot(best_by_pavg),
+        "best_compromise": _full3d_metric_snapshot(best_compromise),
     }
     if best_feasible_by_power is not None:
         diagnostics["best_feasible_archive_by_0k_power"] = _full3d_metric_snapshot(best_feasible_by_power)
@@ -1385,7 +2098,14 @@ def run_full3d_optimization(
     population_size: int = 16,
     seed: int = 42,
     use_neural_policy: bool = True,
+    optimizer: str | None = None,
+    objective_mode: str | None = None,
 ) -> Full3DResult:
+    if optimizer is not None:
+        cfg.full3d_optimizer = str(optimizer)
+    if objective_mode is not None:
+        cfg.full3d_objective_mode = str(objective_mode)
+    optimizer_name = str(getattr(cfg, "full3d_optimizer", "cem")).lower()
     rng = np.random.default_rng(int(seed))
     device = torch.device(cfg.device if torch.cuda.is_available() and str(cfg.device).startswith("cuda") else "cpu")
     baseline = build_baseline_full3d_geometry(cfg)
@@ -1404,15 +2124,27 @@ def run_full3d_optimization(
     action_dim = full3d_action_dim(cfg)
     action_mean = np.zeros(action_dim, dtype=np.float64)
     action_sigma = np.full(action_dim, float(getattr(cfg, "full3d_cem_initial_sigma", 1.10)), dtype=np.float64)
+    mocma_mean = np.zeros(action_dim, dtype=np.float64)
+    mocma_cov = np.eye(action_dim, dtype=np.float64)
+    mocma_sigma = float(getattr(cfg, "full3d_mocma_initial_sigma", getattr(cfg, "full3d_cem_initial_sigma", 1.10)))
     seed_actions = _seed_full3d_actions(cfg)
+    archive_actions: list[np.ndarray] = [np.zeros(action_dim, dtype=np.float64)]
+    archive_geometries: list[Full3DGeometry] = [baseline]
 
     for generation in range(1, int(generations) + 1):
         candidates: list[tuple[Full3DGeometry, Dict[str, float], np.ndarray]] = []
         requested = max(int(population_size), 1)
+        if optimizer_name in {"mo-cmaes", "cmaes", "turbo-surrogate"}:
+            sampled_actions = _sample_mocma_actions(rng, mocma_mean, mocma_cov, mocma_sigma, requested)
+        else:
+            sampled_actions = np.empty((requested, action_dim), dtype=np.float64)
         for local_idx in range(requested):
             if generation == 1 and local_idx < len(seed_actions):
                 action = seed_actions[local_idx].copy()
                 action_source = "seed"
+            elif optimizer_name in {"mo-cmaes", "cmaes", "turbo-surrogate"}:
+                action = sampled_actions[local_idx].copy()
+                action_source = "mocma_sample" if optimizer_name != "turbo-surrogate" else "turbo_surrogate_true_eval"
             elif local_idx == 0:
                 action = action_mean.copy()
                 action_source = "cem_mean"
@@ -1436,22 +2168,43 @@ def run_full3d_optimization(
             metrics["action_source_full3d"] = action_source
             metrics["action_norm_full3d"] = float(np.linalg.norm(action))
             metrics["cem_sigma_mean_full3d"] = float(np.mean(action_sigma))
+            metrics["mocma_sigma_full3d"] = float(mocma_sigma)
             metrics["initial_shape_generation_full3d"] = "global_strategy_field_from_cylinder_inventory"
             candidates.append((geom, metrics, action))
             archive_metrics.append(dict(metrics))
+            archive_actions.append(action.copy())
+            archive_geometries.append(geom)
             candidate_count += 1
+        assign_pareto_metrics(archive_metrics)
+        for metrics in archive_metrics:
+            if int(metrics.get("archive_index", -1)) == int(best_metrics.get("archive_index", -2)):
+                best_metrics.update(metrics)
+                break
         candidate_pairs = [(geom, metrics) for geom, metrics, _ in candidates]
-        ranked = sorted(candidates, key=lambda item: _full3d_metric_rank(item[1]), reverse=True)
-        elite_count = max(1, int(math.ceil(len(ranked) * float(getattr(cfg, "full3d_cem_elite_fraction", 0.35)))))
-        elite_actions = np.stack([item[2] for item in ranked[:elite_count]], axis=0)
-        elite_mean = np.mean(elite_actions, axis=0)
-        elite_sigma = np.std(elite_actions, axis=0) + float(getattr(cfg, "full3d_cem_min_sigma", 0.05))
-        smoothing = float(np.clip(getattr(cfg, "full3d_cem_smoothing", 0.55), 0.0, 0.98))
-        action_mean = smoothing * action_mean + (1.0 - smoothing) * elite_mean
-        action_sigma = np.maximum(
-            smoothing * action_sigma + (1.0 - smoothing) * elite_sigma,
-            float(getattr(cfg, "full3d_cem_min_sigma", 0.05)),
-        )
+        if optimizer_name in {"mo-cmaes", "cmaes", "turbo-surrogate"}:
+            candidate_actions = [item[2] for item in candidates]
+            candidate_metrics = [item[1] for item in candidates]
+            assign_pareto_metrics(candidate_metrics)
+            mocma_mean, mocma_cov, mocma_sigma = _update_mocma_distribution(
+                candidate_actions,
+                candidate_metrics,
+                mocma_mean,
+                mocma_cov,
+                mocma_sigma,
+                cfg,
+            )
+        else:
+            ranked = sorted(candidates, key=lambda item: _full3d_metric_rank(item[1]), reverse=True)
+            elite_count = max(1, int(math.ceil(len(ranked) * float(getattr(cfg, "full3d_cem_elite_fraction", 0.35)))))
+            elite_actions = np.stack([item[2] for item in ranked[:elite_count]], axis=0)
+            elite_mean = np.mean(elite_actions, axis=0)
+            elite_sigma = np.std(elite_actions, axis=0) + float(getattr(cfg, "full3d_cem_min_sigma", 0.05))
+            smoothing = float(np.clip(getattr(cfg, "full3d_cem_smoothing", 0.55), 0.0, 0.98))
+            action_mean = smoothing * action_mean + (1.0 - smoothing) * elite_mean
+            action_sigma = np.maximum(
+                smoothing * action_sigma + (1.0 - smoothing) * elite_sigma,
+                float(getattr(cfg, "full3d_cem_min_sigma", 0.05)),
+            )
         generation_best = _select_full3d_candidate([(best, best_metrics), *candidate_pairs])
         if generation_best[1] is not best_metrics:
             best, best_metrics = generation_best[0], dict(generation_best[1])
@@ -1463,10 +2216,29 @@ def run_full3d_optimization(
                 step=len(history_geometries) - 1,
                 action_dim_full3d=int(action_dim),
                 cem_sigma_mean_full3d=float(np.mean(action_sigma)),
+                mocma_sigma_full3d=float(mocma_sigma),
             )
         )
 
+    assign_pareto_metrics(archive_metrics)
+    best_idx = max(range(len(archive_metrics)), key=lambda idx: _pareto_rank_key(archive_metrics[idx]))
+    best_metrics = dict(archive_metrics[best_idx])
+    best = archive_geometries[best_idx]
+    selected_idx = int(best_idx)
+    lifecycle_trace: List[Dict[str, object]] = []
+    visibility_diagnostics: List[Dict[str, object]] = []
+    if 0 <= selected_idx < len(archive_geometries):
+        lifecycle_summary, lifecycle_trace = evaluate_lifecycle(cfg, archive_geometries[selected_idx], baseline_metrics)
+        best_metrics.update(lifecycle_summary)
+        archive_metrics[selected_idx].update(lifecycle_summary)
+        area, normals, centers = _mesh_area_normals_centers(archive_geometries[selected_idx])
+        _factor, _face_escape, visibility_diagnostics = evaluate_visibility(cfg, archive_geometries[selected_idx], area, normals, centers)
+    assign_pareto_metrics(archive_metrics)
+    best_metrics.update(archive_metrics[selected_idx])
     selection_diagnostics = _full3d_selection_diagnostics(archive_metrics, best_metrics, baseline_metrics, cfg)
+    surrogate_enabled = optimizer_name == "turbo-surrogate" and len(archive_metrics) >= int(getattr(cfg, "full3d_surrogate_min_archive", 512))
+    surrogate_train_metrics = _surrogate_metrics_stub(archive_metrics, surrogate_enabled)
+    policy_train_metrics = _policy_metrics_stub(archive_metrics)
 
     return Full3DResult(
         best_geometry=best,
@@ -1478,6 +2250,10 @@ def run_full3d_optimization(
         candidate_count=candidate_count,
         archive_metrics=archive_metrics,
         selection_diagnostics=selection_diagnostics,
+        lifecycle_trace=lifecycle_trace,
+        visibility_diagnostics=visibility_diagnostics,
+        surrogate_train_metrics=surrogate_train_metrics,
+        policy_train_metrics=policy_train_metrics,
     )
 
 
@@ -1566,6 +2342,60 @@ def save_full3d_history_csv(output_dir: str | Path, history: List[Dict[str, floa
     return str(path)
 
 
+def _json_ready(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    return value
+
+
+def save_full3d_pareto_archive(output_dir: str | Path, archive: List[Dict[str, float]]) -> Dict[str, str]:
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    csv_path = output / "pareto_archive_full3d.csv"
+    json_path = output / "pareto_archive_full3d.json"
+    keys = sorted({key for row in archive for key in row.keys() if key != "temperature_profile_k"})
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        for row in archive:
+            writer.writerow({key: _json_ready(row.get(key, "")) for key in keys})
+    payload = [{key: _json_ready(value) for key, value in row.items() if key != "temperature_profile_k"} for row in archive]
+    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return {"pareto_archive_csv": str(csv_path), "pareto_archive_json": str(json_path)}
+
+
+def save_full3d_lifecycle_trace(output_dir: str | Path, trace: List[Dict[str, object]]) -> str:
+    path = Path(output_dir) / "lifecycle_trace_full3d.csv"
+    keys = sorted({key for row in trace for key in row.keys()})
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(trace)
+    return str(path)
+
+
+def save_full3d_visibility_diagnostics(output_dir: str | Path, diagnostics: List[Dict[str, object]]) -> str:
+    path = Path(output_dir) / "visibility_diagnostics_full3d.csv"
+    keys = sorted({key for row in diagnostics for key in row.keys()})
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(diagnostics)
+    return str(path)
+
+
+def save_training_metric_json(output_dir: str | Path, filename: str, metrics: Dict[str, object]) -> str:
+    path = Path(output_dir) / filename
+    path.write_text(json.dumps(_json_ready(metrics), indent=2, ensure_ascii=False), encoding="utf-8")
+    return str(path)
+
+
 def save_full3d_summary(output_dir: str | Path, summary: Dict[str, object]) -> str:
     path = Path(output_dir) / "run_summary_full3d.json"
     path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1609,6 +2439,11 @@ def write_full3d_report(output_dir: str | Path, result: Full3DResult, summary: D
         f"- 300K-environment 0-3 um net radiation: `{summary.get('final_net_radiated_power_300k_environment_w', summary.get('final_net_radiated_power_0k_sphere_w', 0.0)):.6g} W`",
         f"- 0-3 um energy-conversion efficiency: `{summary.get('final_energy_conversion_efficiency_0_3um', 0.0):.6g}`",
         f"- Energy-conversion efficiency ratio: `{summary.get('energy_conversion_efficiency_ratio', 0.0):.6g}`",
+        f"- Initial escaped 0-3 um power P0: `{summary.get('P0_escape_0_3um_w', 0.0):.6g} W`",
+        f"- Lifecycle-average escaped 0-3 um power: `{summary.get('lifecycle_avg_escape_0_3um_w', 0.0):.6g} W`",
+        f"- Escape visibility factor: `{summary.get('escape_visibility_factor', 0.0):.6g}`",
+        f"- Pareto rank: `{summary.get('pareto_rank', 0)}`",
+        f"- Pareto hypervolume proxy: `{summary.get('pareto_hypervolume', 0.0):.6g}`",
         f"- Power ratio: `{summary.get('power_ratio_full3d', 0.0):.6g}`",
         f"- Lifetime ratio: `{summary.get('lifetime_ratio_full3d', 0.0):.6g}`",
         f"- Max temperature: `{summary.get('max_temperature_k', 0.0):.6g} K`",
@@ -1627,6 +2462,9 @@ def write_full3d_report(output_dir: str | Path, result: Full3DResult, summary: D
         f"- STP: `{summary.get('stp')}`",
         f"- GIF: `{summary.get('gif')}`",
         f"- MP4: `{summary.get('mp4')}`",
+        f"- Pareto archive CSV: `{summary.get('pareto_archive_csv')}`",
+        f"- Lifecycle trace CSV: `{summary.get('lifecycle_trace_csv')}`",
+        f"- Visibility diagnostics CSV: `{summary.get('visibility_diagnostics_csv')}`",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(path)

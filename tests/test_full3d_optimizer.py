@@ -13,7 +13,11 @@ from utils.full3d_optimizer import (
     _apply_full3d_topology_action,
     build_full3d_initial_shape_from_action,
     build_baseline_full3d_geometry,
+    assign_pareto_metrics,
+    evaluate_feature_scales,
     evaluate_full3d_geometry,
+    evaluate_lifecycle,
+    evaluate_visibility,
     full3d_action_dim,
     mesh_volume,
     project_full3d_geometry,
@@ -42,6 +46,9 @@ class Full3DOptimizerTest(unittest.TestCase):
         cfg.voltage_refine_levels = 1
         cfg.voltage_refine_points = 7
         cfg.thermal_max_iters = 80
+        cfg.full3d_lifecycle_steps = 2
+        cfg.full3d_visibility_rays = 8
+        cfg.full3d_visibility_patch_limit = 8
         return cfg
 
     def test_baseline_closed_mesh_preserves_volume_and_electrodes(self) -> None:
@@ -210,6 +217,94 @@ class Full3DOptimizerTest(unittest.TestCase):
         self.assertIn("energy_conversion_efficiency_0_3um", result.best_metrics)
         self.assertLessEqual(result.best_metrics["volume_change_ratio_3d"], 5.0e-5)
         self.assertTrue(result.best_metrics["top_bottom_faces_variable"])
+
+    def test_feature_scale_detects_contact_footprint_change(self) -> None:
+        cfg = self._small_cfg()
+        target = math.pi * cfg.radius * cfg.radius * cfg.height
+        baseline = project_full3d_geometry(cfg, build_baseline_full3d_geometry(cfg), target)
+        base = evaluate_feature_scales(cfg, baseline)
+        vertices = baseline.vertices.copy()
+        vertices[baseline.lower_electrode_indices, :2] *= 0.55
+        vertices[baseline.upper_electrode_indices, :2] *= 0.55
+        shrunk = type(baseline)(
+            vertices=vertices,
+            faces=baseline.faces,
+            side_indices=baseline.side_indices,
+            lower_cap_indices=baseline.lower_cap_indices,
+            upper_cap_indices=baseline.upper_cap_indices,
+            lower_electrode_indices=baseline.lower_electrode_indices,
+            upper_electrode_indices=baseline.upper_electrode_indices,
+            num_rings=baseline.num_rings,
+            num_segments=baseline.num_segments,
+            cap_rings=baseline.cap_rings,
+        )
+        changed = evaluate_feature_scales(cfg, shrunk)
+        self.assertLess(changed["feature_lower_contact_equiv_diameter_m"], base["feature_lower_contact_equiv_diameter_m"])
+        self.assertLess(changed["feature_min_neck_scale_m"], base["feature_min_neck_scale_m"])
+
+    def test_visibility_ray_cast_penalizes_inward_notch(self) -> None:
+        cfg = self._small_cfg()
+        cfg.full3d_visibility_rays = 12
+        cfg.full3d_visibility_patch_limit = 12
+        baseline = project_full3d_geometry(
+            cfg,
+            build_baseline_full3d_geometry(cfg),
+            math.pi * cfg.radius * cfg.radius * cfg.height,
+        )
+        base_factor, _, _ = evaluate_visibility(cfg, baseline)
+        vertices = baseline.vertices.copy()
+        notch_ids = baseline.side_indices[3:7, :4].reshape(-1)
+        vertices[notch_ids, :2] *= 0.40
+        notched = type(baseline)(
+            vertices=vertices,
+            faces=baseline.faces,
+            side_indices=baseline.side_indices,
+            lower_cap_indices=baseline.lower_cap_indices,
+            upper_cap_indices=baseline.upper_cap_indices,
+            lower_electrode_indices=baseline.lower_electrode_indices,
+            upper_electrode_indices=baseline.upper_electrode_indices,
+            num_rings=baseline.num_rings,
+            num_segments=baseline.num_segments,
+            cap_rings=baseline.cap_rings,
+        )
+        notched_factor, _, diagnostics = evaluate_visibility(cfg, notched)
+        self.assertGreater(len(diagnostics), 0)
+        self.assertLessEqual(notched_factor, base_factor + 0.15)
+
+    def test_lifecycle_outputs_trace_and_average_power(self) -> None:
+        cfg = self._small_cfg()
+        cfg.full3d_objective_mode = "sota"
+        geom = project_full3d_geometry(
+            cfg,
+            build_baseline_full3d_geometry(cfg),
+            math.pi * cfg.radius * cfg.radius * cfg.height,
+        )
+        baseline_metrics = evaluate_full3d_geometry(cfg, geom, include_lifecycle=False)
+        lifecycle, trace = evaluate_lifecycle(cfg, geom, baseline_metrics)
+        self.assertGreaterEqual(len(trace), 1)
+        self.assertIn("lifecycle_avg_escape_0_3um_w", lifecycle)
+        self.assertIn("feature_failure_reason", lifecycle)
+
+    def test_pareto_sort_prefers_nondominated_feasible_items(self) -> None:
+        rows = [
+            {"constraint_feasible_3d": True, "P0_escape_0_3um_w": 1.0, "lifetime_s_full3d": 1.0, "lifecycle_avg_escape_0_3um_w": 1.0, "escape_visibility_factor": 0.5},
+            {"constraint_feasible_3d": True, "P0_escape_0_3um_w": 2.0, "lifetime_s_full3d": 2.0, "lifecycle_avg_escape_0_3um_w": 2.0, "escape_visibility_factor": 0.8},
+            {"constraint_feasible_3d": False, "P0_escape_0_3um_w": 3.0, "lifetime_s_full3d": 3.0, "lifecycle_avg_escape_0_3um_w": 3.0, "escape_visibility_factor": 0.9},
+        ]
+        assign_pareto_metrics(rows)
+        self.assertEqual(rows[1]["pareto_rank"], 0)
+        self.assertGreater(rows[0]["pareto_rank"], rows[1]["pareto_rank"])
+        self.assertGreater(rows[2]["pareto_rank"], rows[1]["pareto_rank"])
+
+    def test_mocma_optimizer_smoke_has_sota_fields(self) -> None:
+        cfg = self._small_cfg()
+        cfg.full3d_objective_mode = "sota"
+        cfg.full3d_optimizer = "mo-cmaes"
+        result = run_full3d_optimization(cfg, generations=1, population_size=2, seed=4, optimizer="mo-cmaes", objective_mode="sota")
+        self.assertIn("P0_escape_0_3um_w", result.best_metrics)
+        self.assertIn("lifecycle_avg_escape_0_3um_w", result.best_metrics)
+        self.assertIn("pareto_hypervolume", result.selection_diagnostics)
+        self.assertEqual(result.selection_diagnostics["optimizer_full3d"], "mo-cmaes")
 
 
 def _electrode_error_for_test(cfg, geometry) -> float:
