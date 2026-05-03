@@ -41,7 +41,23 @@ $$
 - 形状评估同时检查体积、电极误差、温度、寿命和辐射收益。
 - 固定电压模式 `--fixed-voltage <V>` 仅用于诊断固定电压是否过温，不用于正式优化。
 
-## 4. 运行命令
+## 4. 动作空间与优化算法
+
+当前 full3d 不再把 U-Net/GNN 当作未定义动作的黑盒扰动，而是显式定义低维三维拓扑动作空间：
+
+- 侧壁动作：`Chebyshev(z) x Fourier(theta)` 低阶系数，输出自由侧面的径向增材/减材位移场。
+- 顶/底面动作：`Chebyshev(radius) x Fourier(theta)` 低阶系数，分别输出上下端面非电极区域的轴向位移场。
+- 电极边界 mask：两端 5mm 圆形电极边界节点固定，动作后再次投影体积并校正电极误差。
+- 默认动作维度为 `91`，可用 `--action-axial-modes`、`--action-circum-modes`、`--action-cap-radial-modes` 调整。
+
+优化算法采用 CEM：
+
+- 每一代在上述动作空间中采样候选形变。
+- 对每个候选 mesh 执行 `V <= 100V` 的额定电压搜索。
+- 优先选择满足体积、电极、温度、热收敛和 `lifetime_ratio >= 0.30` 的候选。
+- 用精英候选更新动作分布；轻量 3D U-Net/GNN 仅作为可选结构化扰动源。
+
+## 5. 运行命令
 
 快速检查：
 
@@ -67,7 +83,20 @@ python -u optimize_3d.py \
 python -u optimize_3d.py --smoke --no-step --experiment-name full3d_fixed20_diag --fixed-voltage 20
 ```
 
-## 5. 关键产物
+可选动作空间/CEM 参数：
+
+```bash
+python -u optimize_3d.py \
+  --experiment-name mcga_full3d_4090 \
+  --action-axial-modes 5 \
+  --action-circum-modes 3 \
+  --action-cap-radial-modes 4 \
+  --cem-initial-sigma 0.85 \
+  --cem-elite-fraction 0.35 \
+  --no-step
+```
+
+## 6. 关键产物
 
 - `optimized_full3d.stl`
 - `optimized_full3d.stp`（未加 `--no-step` 且 FreeCAD 可用时）
@@ -77,7 +106,7 @@ python -u optimize_3d.py --smoke --no-step --experiment-name full3d_fixed20_diag
 - `run_summary_full3d.json`
 - `design_strategy_report_full3d.md`
 
-## 6. 交接索引
+## 7. 交接索引
 
 - RTX4090 服务器运行说明见 `docs/cloud_train_rtx4090_zh.md`。
 - 历史实现、物理口径修正、legacy 删除记录见 `docs/workflow_log.md`。

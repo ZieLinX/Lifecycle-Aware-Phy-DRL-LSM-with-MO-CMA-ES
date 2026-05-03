@@ -321,6 +321,179 @@ def _apply_strategy_displacement(cfg, geometry: Full3DGeometry, strategy: torch.
     return _clone_geometry(geometry, vertices)
 
 
+def _full3d_action_layout(cfg) -> Dict[str, int]:
+    axial_modes = max(int(getattr(cfg, "full3d_action_axial_modes", 5)), 1)
+    circum_modes = max(int(getattr(cfg, "full3d_action_circum_modes", 3)), 0)
+    cap_modes = max(int(getattr(cfg, "full3d_action_cap_radial_modes", 4)), 1)
+    circum_terms = 1 + 2 * circum_modes
+    side_dim = axial_modes * circum_terms
+    cap_dim = 2 * cap_modes * circum_terms
+    return {
+        "axial_modes": axial_modes,
+        "circum_modes": circum_modes,
+        "cap_modes": cap_modes,
+        "circum_terms": circum_terms,
+        "side_dim": side_dim,
+        "cap_dim": cap_dim,
+        "action_dim": side_dim + cap_dim,
+    }
+
+
+def full3d_action_dim(cfg) -> int:
+    """Number of low-order topology action coefficients used by full3d CEM."""
+
+    return int(_full3d_action_layout(cfg)["action_dim"])
+
+
+def _chebyshev_basis(values: np.ndarray, modes: int) -> np.ndarray:
+    values = np.clip(np.asarray(values, dtype=np.float64), -1.0, 1.0)
+    modes = max(int(modes), 1)
+    basis = np.ones((values.size, modes), dtype=np.float64)
+    if modes > 1:
+        basis[:, 1] = values
+    for midx in range(2, modes):
+        basis[:, midx] = 2.0 * values * basis[:, midx - 1] - basis[:, midx - 2]
+    return basis
+
+
+def _circum_basis(num_segments: int, circum_modes: int) -> np.ndarray:
+    theta = np.linspace(0.0, 2.0 * math.pi, int(num_segments), endpoint=False, dtype=np.float64)
+    cols = [np.ones_like(theta)]
+    for mode in range(1, int(circum_modes) + 1):
+        cols.append(np.cos(float(mode) * theta))
+        cols.append(np.sin(float(mode) * theta))
+    return np.stack(cols, axis=1)
+
+
+def _basis_field(primary_basis: np.ndarray, coeff: np.ndarray, circum_basis: np.ndarray) -> np.ndarray:
+    field = primary_basis @ coeff @ circum_basis.T
+    return np.tanh(field)
+
+
+def _apply_indexed_displacement(
+    vertices: np.ndarray,
+    ids: np.ndarray,
+    displacement: np.ndarray,
+    axis: int | None = None,
+) -> None:
+    flat_ids = np.asarray(ids, dtype=np.int64).reshape(-1)
+    flat_disp = np.asarray(displacement, dtype=np.float64).reshape(-1)
+    valid = flat_ids >= 0
+    if not np.any(valid):
+        return
+    flat_ids = flat_ids[valid]
+    flat_disp = flat_disp[valid]
+    sums = np.bincount(flat_ids, weights=flat_disp, minlength=vertices.shape[0])
+    counts = np.bincount(flat_ids, minlength=vertices.shape[0])
+    touched = counts > 0
+    averaged = np.zeros(vertices.shape[0], dtype=np.float64)
+    averaged[touched] = sums[touched] / counts[touched]
+    if axis is None:
+        raise ValueError("axis must be provided for scalar indexed displacement")
+    vertices[touched, axis] += averaged[touched]
+
+
+def _apply_full3d_topology_action(
+    cfg,
+    geometry: Full3DGeometry,
+    action: np.ndarray,
+    amplitude: float,
+) -> Full3DGeometry:
+    """Apply the explicit full3d topology action space.
+
+    The action is a compact set of spectral coefficients:
+    side-wall radial displacement over Chebyshev(z) x Fourier(theta), plus
+    independent lower/upper cap axial displacement over Chebyshev(radius) x
+    Fourier(theta). Electrode boundary vertices remain fixed by construction
+    and are reset again during projection.
+    """
+
+    layout = _full3d_action_layout(cfg)
+    action_dim = int(layout["action_dim"])
+    coeffs = np.zeros(action_dim, dtype=np.float64)
+    raw = np.asarray(action, dtype=np.float64).reshape(-1)
+    coeffs[: min(raw.size, action_dim)] = raw[:action_dim]
+    coeffs = np.clip(coeffs, -3.0, 3.0)
+
+    axial_modes = int(layout["axial_modes"])
+    circum_modes = int(layout["circum_modes"])
+    circum_terms = int(layout["circum_terms"])
+    cap_modes = int(layout["cap_modes"])
+    side_dim = int(layout["side_dim"])
+
+    vertices = geometry.vertices.copy()
+    free = _free_vertex_mask(geometry)
+    side_coeff = coeffs[:side_dim].reshape(axial_modes, circum_terms)
+    cap_coeff = coeffs[side_dim:].reshape(2, cap_modes, circum_terms)
+
+    side = vertices[geometry.side_indices]
+    z = np.mean(side[:, :, 2], axis=1)
+    z_norm = 2.0 * (z - np.min(z)) / max(float(np.max(z) - np.min(z)), 1.0e-12) - 1.0
+    axial_basis = _chebyshev_basis(z_norm, axial_modes)
+    circum = _circum_basis(geometry.num_segments, circum_modes)
+    axial_fade = np.sin(math.pi * np.clip((z_norm + 1.0) * 0.5, 0.0, 1.0))
+    side_field = _basis_field(axial_basis, side_coeff, circum) * axial_fade[:, None]
+    side_ids = geometry.side_indices.reshape(-1)
+    side_disp = side_field.reshape(-1)
+    side_valid = side_ids >= 0
+    side_ids = side_ids[side_valid]
+    side_disp = side_disp[side_valid]
+    side_ids = side_ids[free[side_ids]]
+    side_disp = side_disp[free[geometry.side_indices.reshape(-1)[side_valid]]]
+    radial = vertices[side_ids, :2]
+    radial_norm = np.linalg.norm(radial, axis=1, keepdims=True)
+    radial_dir = radial / np.maximum(radial_norm, 1.0e-12)
+    vertices[side_ids, :2] += float(amplitude) * side_disp[:, None] * radial_dir
+
+    for cap_idx, grid in enumerate((geometry.lower_cap_indices[1:], geometry.upper_cap_indices[1:])):
+        cap_vertices = vertices[grid]
+        radial_fraction = np.linalg.norm(cap_vertices[:, :, :2], axis=2) / max(float(cfg.radius), 1.0e-12)
+        inward = np.clip(1.0 - radial_fraction, 0.0, 1.0)
+        cap_basis = _chebyshev_basis(2.0 * inward[:, 0] - 1.0, cap_modes)
+        cap_fade = np.sin(0.5 * math.pi * inward)
+        cap_field = _basis_field(cap_basis, cap_coeff[cap_idx], circum) * cap_fade
+        cap_ids = grid.reshape(-1)
+        cap_disp = float(amplitude) * 0.85 * cap_field.reshape(-1)
+        cap_valid = (cap_ids >= 0) & free[np.maximum(cap_ids, 0)]
+        if np.any(cap_valid):
+            _apply_indexed_displacement(vertices, cap_ids[cap_valid], cap_disp[cap_valid], axis=2)
+
+    return _clone_geometry(geometry, vertices)
+
+
+def _seed_full3d_actions(cfg) -> list[np.ndarray]:
+    layout = _full3d_action_layout(cfg)
+    action_dim = int(layout["action_dim"])
+    axial_modes = int(layout["axial_modes"])
+    circum_terms = int(layout["circum_terms"])
+    side_dim = int(layout["side_dim"])
+    seeds = [np.zeros(action_dim, dtype=np.float64)]
+
+    def add_side(mode: int, term: int, value: float) -> None:
+        action = np.zeros(action_dim, dtype=np.float64)
+        if mode < axial_modes and term < circum_terms:
+            action[mode * circum_terms + term] = float(value)
+            seeds.append(action)
+
+    add_side(0, 0, 1.0)
+    add_side(0, 0, -1.0)
+    add_side(1, 0, 0.8)
+    add_side(1, 0, -0.8)
+    if circum_terms > 1:
+        add_side(0, 1, 0.7)
+        add_side(0, 2, 0.7)
+
+    cap_start = side_dim
+    for cap_idx in range(2):
+        action = np.zeros(action_dim, dtype=np.float64)
+        action[cap_start + cap_idx * int(layout["cap_modes"]) * circum_terms] = 0.6
+        seeds.append(action)
+        action = np.zeros(action_dim, dtype=np.float64)
+        action[cap_start + cap_idx * int(layout["cap_modes"]) * circum_terms] = -0.6
+        seeds.append(action)
+    return seeds
+
+
 def _polygon_area_xy(points: np.ndarray) -> float:
     x = points[:, 0]
     y = points[:, 1]
@@ -517,9 +690,9 @@ def _solve_full3d_thermal_state(
         k_nodes, _ = _material_properties_np(cfg, temperature)
         k_seg = 0.5 * (k_nodes[:-1] + k_nodes[1:])
         conductance = k_seg * area_seg / dz
-        radiation = _radiative_loss_by_node(cfg, temperature, effective_s)
+        radiation = _radiative_loss_by_node(cfg, temperature, free_s)
         evaporation = _evaporative_loss_by_node(cfg, temperature, free_s)
-        rad_slope = _radiative_loss_slope_by_node(cfg, temperature, effective_s)
+        rad_slope = _radiative_loss_slope_by_node(cfg, temperature, free_s)
         evap_slope = _evaporative_loss_slope_by_node(cfg, temperature, free_s)
 
         residual = np.zeros_like(temperature)
@@ -580,7 +753,7 @@ def _solve_full3d_thermal_state(
     resistance = max(float(np.sum(segment_resistance)), float(cfg.min_resistance))
     current = min(voltage / resistance, float(cfg.max_current))
     electrical_power = voltage * current
-    full_radiative_by_node = _radiative_loss_by_node(cfg, temperature, effective_s)
+    full_radiative_by_node = _radiative_loss_by_node(cfg, temperature, free_s)
     evaporative_by_node = _evaporative_loss_by_node(cfg, temperature, free_s)
     full_radiative_power = float(np.sum(full_radiative_by_node))
     evaporative_power = float(np.sum(evaporative_by_node))
@@ -675,7 +848,15 @@ def _evaluate_full3d_geometry_at_voltage(
     )
     thermal_sink_temp = _radiation_sink_temperature(cfg)
     sphere_temp = float(getattr(cfg, "full3d_sphere_temperature_k", 0.0))
-    net_band_power = float(np.sum(
+    band_power_0k_sphere = float(np.sum(
+        float(cfg.band_emissivity)
+        * float(cfg.stefan_boltzmann)
+        * float(getattr(cfg, "radiative_cooling_scale", 1.0))
+        * effective_area_by_ring
+        * np.maximum(np.power(temperature_profile, 4) - sphere_temp ** 4, 0.0)
+        * band_fraction_by_ring
+    ))
+    band_power_300k_environment = float(np.sum(
         float(cfg.band_emissivity)
         * float(cfg.stefan_boltzmann)
         * float(getattr(cfg, "radiative_cooling_scale", 1.0))
@@ -683,6 +864,7 @@ def _evaluate_full3d_geometry_at_voltage(
         * np.maximum(np.power(temperature_profile, 4) - thermal_sink_temp ** 4, 0.0)
         * band_fraction_by_ring
     ))
+    net_band_power = band_power_0k_sphere
     evap_flux = _evaporation_flux_np(cfg, temperature_profile)
     mass_loss_rate = float(np.sum(evap_flux * free_area))
     recession_rate = evap_flux / max(float(cfg.density), 1.0e-12)
@@ -751,7 +933,7 @@ def _evaluate_full3d_geometry_at_voltage(
         "mean_temperature_k": mean_temperature,
         "max_temperature_k": max_temperature,
         "net_radiated_power_0k_sphere_w": float(net_band_power),
-        "net_radiated_power_300k_environment_w": float(net_band_power),
+        "net_radiated_power_300k_environment_w": float(band_power_300k_environment),
         "rated_operating_score_w": float(rated_operating_score),
         "lifecycle_factor_full3d": float(lifecycle_factor),
         "effective_radiating_area_m2": float(thermal["effective_radiating_area_m2"]),
@@ -759,6 +941,7 @@ def _evaluate_full3d_geometry_at_voltage(
         "surface_area_m2": float(surface_area),
         "surface_area_ratio": float(surface_area / max(cylinder_area, 1.0e-12)),
         "free_radiating_surface_area_m2": float(side_area),
+        "free_surface_thermal_balance_area_m2": float(side_area),
         "contact_end_face_area_m2": float(surface_area - side_area),
         "axial_resistance_shape_factor_m_inv": float(thermal["axial_resistance_shape_factor_m_inv"]),
         "escape_view_factor_proxy": float(thermal["escape_view_factor_proxy"]),
@@ -933,6 +1116,13 @@ def _full3d_selection_diagnostics(
         "voltage_search_mode": mode,
         "fixed_voltage_v": fixed_voltage,
         "rated_voltage_upper_bound_v": float(cfg.max_voltage),
+        "action_space_full3d": (
+            "low-order Chebyshev(z) x Fourier(theta) side-wall radial displacement plus "
+            "Chebyshev(radius) x Fourier(theta) top/bottom cap axial displacement; "
+            "5 mm electrode boundary vertices are masked and volume is projected after each action"
+        ),
+        "action_dim_full3d": int(full3d_action_dim(cfg)),
+        "cem_elite_fraction_full3d": float(getattr(cfg, "full3d_cem_elite_fraction", 0.35)),
         "max_allowed_temperature_k": float(cfg.max_temp),
         "baseline_feasible_full3d": baseline_feasible,
         "archive_candidate_count": int(len(archive_metrics)),
@@ -973,31 +1163,68 @@ def run_full3d_optimization(
     candidate_count = 1
     archive_metrics = [dict(baseline_metrics)]
     amplitude = float(getattr(cfg, "max_depth", 1.6e-4))
+    action_dim = full3d_action_dim(cfg)
+    action_mean = np.zeros(action_dim, dtype=np.float64)
+    action_sigma = np.full(action_dim, float(getattr(cfg, "full3d_cem_initial_sigma", 0.85)), dtype=np.float64)
+    seed_actions = _seed_full3d_actions(cfg)
 
     for generation in range(1, int(generations) + 1):
-        candidates: list[tuple[Full3DGeometry, Dict[str, float]]] = []
-        for _ in range(int(population_size)):
+        candidates: list[tuple[Full3DGeometry, Dict[str, float], np.ndarray]] = []
+        requested = max(int(population_size), 1)
+        for local_idx in range(requested):
+            if generation == 1 and local_idx < len(seed_actions):
+                action = seed_actions[local_idx].copy()
+                action_source = "seed"
+            elif local_idx == 0:
+                action = action_mean.copy()
+                action_source = "cem_mean"
+            else:
+                action = rng.normal(action_mean, action_sigma)
+                action_source = "cem_sample"
+            geom = _apply_full3d_topology_action(cfg, current, action, amplitude)
             if bool(use_neural_policy):
                 volume = _geometry_to_policy_volume(cfg, current, device)
                 with torch.no_grad():
                     strategy = policy(volume)
-            else:
-                strategy = torch.rand((1, 3, 8, 16, 16), dtype=torch.float32, device=device)
-            geom = _apply_strategy_displacement(cfg, current, strategy, amplitude * float(rng.uniform(0.4, 1.4)))
+                geom = _apply_strategy_displacement(cfg, geom, strategy, 0.20 * amplitude * float(rng.uniform(0.4, 1.0)))
             geom = project_full3d_geometry(cfg, geom, target_volume)
             metrics = evaluate_full3d_geometry(cfg, geom, baseline_metrics)
             metrics["archive_index"] = int(candidate_count)
             metrics["generation"] = int(generation)
-            candidates.append((geom, metrics))
+            metrics["action_dim_full3d"] = int(action_dim)
+            metrics["action_source_full3d"] = action_source
+            metrics["action_norm_full3d"] = float(np.linalg.norm(action))
+            metrics["cem_sigma_mean_full3d"] = float(np.mean(action_sigma))
+            candidates.append((geom, metrics, action))
             archive_metrics.append(dict(metrics))
             candidate_count += 1
-        geom, metrics = _select_full3d_candidate(candidates)
+        candidate_pairs = [(geom, metrics) for geom, metrics, _ in candidates]
+        geom, metrics = _select_full3d_candidate(candidate_pairs)
         current = geom
-        generation_best = _select_full3d_candidate([(best, best_metrics), *candidates])
+        ranked = sorted(candidates, key=lambda item: _full3d_metric_rank(item[1]), reverse=True)
+        elite_count = max(1, int(math.ceil(len(ranked) * float(getattr(cfg, "full3d_cem_elite_fraction", 0.35)))))
+        elite_actions = np.stack([item[2] for item in ranked[:elite_count]], axis=0)
+        elite_mean = np.mean(elite_actions, axis=0)
+        elite_sigma = np.std(elite_actions, axis=0) + float(getattr(cfg, "full3d_cem_min_sigma", 0.05))
+        smoothing = float(np.clip(getattr(cfg, "full3d_cem_smoothing", 0.55), 0.0, 0.98))
+        action_mean = smoothing * action_mean + (1.0 - smoothing) * elite_mean
+        action_sigma = np.maximum(
+            smoothing * action_sigma + (1.0 - smoothing) * elite_sigma,
+            float(getattr(cfg, "full3d_cem_min_sigma", 0.05)),
+        )
+        generation_best = _select_full3d_candidate([(best, best_metrics), *candidate_pairs])
         if generation_best[1] is not best_metrics:
             best, best_metrics = generation_best[0], dict(generation_best[1])
         history_geometries.append(best)
-        history_metrics.append(dict(best_metrics, generation=generation, step=len(history_geometries) - 1))
+        history_metrics.append(
+            dict(
+                best_metrics,
+                generation=generation,
+                step=len(history_geometries) - 1,
+                action_dim_full3d=int(action_dim),
+                cem_sigma_mean_full3d=float(np.mean(action_sigma)),
+            )
+        )
         amplitude *= 0.82
 
     selection_diagnostics = _full3d_selection_diagnostics(archive_metrics, best_metrics, baseline_metrics, cfg)
@@ -1119,7 +1346,8 @@ def write_full3d_report(output_dir: str | Path, result: Full3DResult, summary: D
         "- The tungsten voltage is applied only between the two tungsten/electrode contact boundaries; electrode voltage drop is zero in this model.",
         "- The two axial contact boundaries are fixed at 300 K, representing well-cooled copper electrodes with ignored contact resistance.",
         "- Only free surfaces radiate to the 300 K environment and sublime; contact end faces do not radiate or sublime.",
-        "- The strategy generator is a lightweight 3D U-Net encoder plus graph-neighborhood smoothing head.",
+        "- The optimizer uses CEM over an explicit low-order full3d topology action space; the optional neural policy supplies structured perturbations.",
+        "- The topology action space combines side-wall radial modes over Chebyshev(z) x Fourier(theta) with top/bottom cap axial modes over Chebyshev(radius) x Fourier(theta).",
         "",
         "## Selection",
         "",

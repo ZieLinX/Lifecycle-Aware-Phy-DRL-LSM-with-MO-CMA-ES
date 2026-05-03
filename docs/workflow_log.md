@@ -1019,3 +1019,67 @@ python -u optimize_3d.py --backend full3d --smoke --no-step --experiment-name fu
 ### 22.4 后续阅读口径
 
 `docs/workflow_log.md` 前面的 1D/RL/hybrid/sidefield 内容是历史过程记录，不代表当前仓库仍保留这些入口。后续 agent 应以 `docs/cloud_train_rtx4090_zh.md` 和 `docs/research_solution_zh.md` 的 full3d-only 说法作为当前操作口径。
+
+## 23. full3d 额定工况与拓扑动作空间再校准
+
+### 23.1 用户新增澄清
+
+用户指出上一轮仍有任务理解偏差。本任务是固定初始材料体积下的三维拓扑优化问题，不是固定 `100V` 评估一个几何，也不是只优化圆柱侧面。
+
+本轮重新对齐以下口径：
+
+- `100V` 是系统最大允许电压上限，不是固定工作电压。
+- 每个候选几何都必须先搜索综合 `0-3um` 辐射收益和蒸发/寿命后的额定稳态；被选额定电压必须 `<=100V`。
+- 初始 5mm x 15mm 圆柱的额定电压约 `0.34V`，作为 sanity check。
+- 寿命比必须不低于初始圆柱寿命的 `30%`。
+- 钨棒内部需要计算轴向导热；两端铜电极按 `300K` 固定温度边界。
+- 忽略钨-铜接触热阻和接触电阻。
+- 电压只跨钨棒两侧，不包含电极压降。
+- 自由表面向 `300K` 环境做净辐射散热并参与升华；电极接触端面不计辐射和升华。
+
+### 23.2 代码修正
+
+- `utils/full3d_optimizer.py`
+  - 保留默认 `rated_search`，每个候选几何在 `V <= 100V` 下搜索额定工况。
+  - 热平衡中自由表面散热改用全部自由表面积对 `300K` 环境净辐射；外接吸收面 `0K` 的 `0-3um` 有效输出仍使用 escaped/effective area 统计。
+  - 新增显式 full3d 拓扑动作空间：
+    - 侧壁 `Chebyshev(z) x Fourier(theta)` 径向位移；
+    - 顶/底面 `Chebyshev(radius) x Fourier(theta)` 轴向位移；
+    - 两端 5mm 电极边界节点 mask 固定；
+    - 每次动作后执行体积投影和电极误差校正。
+  - `run_full3d_optimization()` 改为 CEM：按动作分布采样候选、用 full3d 物理额定搜索评估、按精英候选更新动作均值和方差。
+  - 轻量 3D U-Net/GNN 保留为可选结构化扰动源，不再作为未定义动作空间的唯一优化器。
+- `config/cylinder_cfg.py`
+  - 新增 `full3d_action_axial_modes`、`full3d_action_circum_modes`、`full3d_action_cap_radial_modes`。
+  - 新增 `full3d_cem_elite_fraction`、`full3d_cem_initial_sigma`、`full3d_cem_min_sigma`、`full3d_cem_smoothing`。
+- `optimize_3d.py`
+  - 新增 CLI 参数 `--action-axial-modes`、`--action-circum-modes`、`--action-cap-radial-modes`、`--cem-initial-sigma`、`--cem-elite-fraction`。
+  - summary 写入 `optimizer`、`action_space_full3d`、`action_dim_full3d`、`cem_elite_fraction_full3d`。
+- `tests/test_full3d_optimizer.py`
+  - 新增显式拓扑动作空间回归测试，确认侧面和端面非电极区域都能被动作移动且电极保持约束。
+  - 增加自由表面热平衡面积字段检查。
+
+### 23.3 本地验证
+
+已通过：
+
+```bash
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_static_compile
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe -m unittest tests.test_full3d_optimizer
+C:\Users\XiZie\.conda\envs\mcga_xzh\python.exe optimize_3d.py --device cpu --smoke --no-step --experiment-name codex_full3d_cem_smoke
+```
+
+CPU smoke 摘要：
+
+- `baseline_voltage_v = 0.34`
+- `final_voltage_v = 0.34`
+- `voltage_search_mode = rated_search`
+- `action_dim_full3d = 91`
+- `power_ratio_full3d = 1.1156`
+- `lifetime_ratio_full3d = 0.9825`
+- `volume_change_ratio_full3d = 2.89e-08`
+- `electrode_voltage_drop_v = 0.0`
+- `electrode_boundary_temperature_k = 300.0`
+- `feasible = True`
+
+说明：该 smoke 仅验证物理/优化/导出链闭环和口径正确性，不代表长预算 RTX4090 最优结果。

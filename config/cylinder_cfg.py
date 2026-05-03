@@ -76,6 +76,13 @@ class CylinderPhysicsCfg:
     full3d_sphere_temperature_k = 0.0
     full3d_sphere_emissivity = 1.0
     full3d_use_neural_policy = True
+    full3d_action_axial_modes = 5
+    full3d_action_circum_modes = 3
+    full3d_action_cap_radial_modes = 4
+    full3d_cem_elite_fraction = 0.35
+    full3d_cem_initial_sigma = 0.85
+    full3d_cem_min_sigma = 0.05
+    full3d_cem_smoothing = 0.55
 
     # Export settings.
     freecad_cmd = ""

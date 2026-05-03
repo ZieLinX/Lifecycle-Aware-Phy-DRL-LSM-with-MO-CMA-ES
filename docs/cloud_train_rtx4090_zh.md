@@ -11,9 +11,11 @@
 - 忽略钨棒和铜电极之间的接触热阻、接触电阻。
 - 电压只加在钨棒两端，铜电极电压降为 0。
 - 只有自由表面参与向 `300K` 环境的净辐射/散热和升华；接触电极的端面不计辐射和升华。
+- 优化目标统计能到达外接吸收面的 `0-3um` 净辐射；热平衡散热边界和目标辐射统计是两个不同字段。
 - `100V` 是系统允许的额定搜索上限，不是固定工作电压。
 - 默认从 `V <= 100V` 中搜索综合辐射收益和蒸发/寿命后的最优稳态；初始 5mm x 15mm 圆柱额定电压约 `0.34V`。
 - `--fixed-voltage <V>` 只用于诊断固定电压是否过温，不用于正式优化。
+- 动作空间为低阶 full3d 拓扑动作：侧壁 `Chebyshev(z) x Fourier(theta)` 径向位移，加顶/底面 `Chebyshev(radius) x Fourier(theta)` 轴向位移；CEM 根据精英候选更新动作分布。
 
 ## 2. 环境准备
 
@@ -101,14 +103,26 @@ for k in [
     "electrode_voltage_drop_v",
     "thermal_radiation_sink_temperature_k",
     "electrode_boundary_temperature_k",
+    "action_dim_full3d",
+    "action_space_full3d",
     "thermal_converged",
     "power_ratio_full3d",
     "lifetime_ratio_full3d",
+    "archive_feasible_count",
     "selection_reason_full3d",
 ]:
     print(k, "=", s.get(k))
 PY
 ```
+
+正式结果至少检查：
+
+- `voltage_search_mode = rated_search`，且 `final_voltage_v <= 100`。
+- `baseline_voltage_v` 对初始圆柱应接近 `0.34V`。
+- `lifetime_ratio_full3d >= 0.30`。
+- `archive_feasible_count > 0`。
+- `electrode_voltage_drop_v = 0`，`electrode_boundary_temperature_k = 300`。
+- `action_dim_full3d` 和 `action_space_full3d` 存在，说明运行的是显式 full3d 拓扑动作空间。
 
 ## 7. 产物回收
 

@@ -27,6 +27,16 @@ def _configure_cfg(args):
     cfg.full3d_fixed_voltage_v = None if args.fixed_voltage is None else float(args.fixed_voltage)
     cfg.full3d_volume_tolerance_ratio = float(args.full3d_volume_tolerance)
     cfg.full3d_cap_rings = int(args.cap_rings)
+    if args.action_axial_modes is not None:
+        cfg.full3d_action_axial_modes = int(args.action_axial_modes)
+    if args.action_circum_modes is not None:
+        cfg.full3d_action_circum_modes = int(args.action_circum_modes)
+    if args.action_cap_radial_modes is not None:
+        cfg.full3d_action_cap_radial_modes = int(args.action_cap_radial_modes)
+    if args.cem_initial_sigma is not None:
+        cfg.full3d_cem_initial_sigma = float(args.cem_initial_sigma)
+    if args.cem_elite_fraction is not None:
+        cfg.full3d_cem_elite_fraction = float(args.cem_elite_fraction)
     if args.smoke:
         cfg.num_segments = 32
         cfg.num_rings = 24
@@ -53,8 +63,12 @@ def _build_summary(args, cfg, result, export_info, anim_info) -> dict[str, objec
         "electrode_constraint": "two 5 mm circular electrode boundaries remain fixed in diameter and relative position",
         "volume_constraint": "pre-energization closed-mesh volume is projected to the initial cylinder volume",
         "thermal_boundary": "300 K fixed-temperature electrode ends plus 300 K free-surface radiative sink; end faces in contact with electrodes do not radiate or sublime",
-        "external_sphere": "legacy field: optical target is escaped 0-3 um free-surface radiation; thermal balance uses the 300 K sink fields",
+        "external_sphere": "optical target is escaped 0-3 um free-surface radiation to a 0 K absorbing sphere; thermal balance uses 300 K free-surface radiation",
         "policy_model": "lightweight 3D U-Net encoder with graph-neighborhood smoothing head",
+        "optimizer": "CEM over explicit low-order full3d topology actions, optionally seeded by the U-Net/GNN structured perturbation",
+        "action_space_full3d": str(result.selection_diagnostics.get("action_space_full3d", "")),
+        "action_dim_full3d": int(result.selection_diagnostics.get("action_dim_full3d", 0)),
+        "cem_elite_fraction_full3d": float(result.selection_diagnostics.get("cem_elite_fraction_full3d", 0.0)),
         "voltage_search_mode": str(result.best_metrics.get("voltage_search_mode", result.selection_diagnostics.get("voltage_search_mode", ""))),
         "voltage_constraint": (
             f"fixed diagnostic voltage {float(cfg.full3d_fixed_voltage_v):.6g} V"
@@ -113,6 +127,11 @@ def main() -> None:
     parser.add_argument("--cap-rings", type=int, default=8)
     parser.add_argument("--full3d-volume-tolerance", type=float, default=1.0e-5)
     parser.add_argument("--full3d-neural-policy", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--action-axial-modes", type=int, default=None)
+    parser.add_argument("--action-circum-modes", type=int, default=None)
+    parser.add_argument("--action-cap-radial-modes", type=int, default=None)
+    parser.add_argument("--cem-initial-sigma", type=float, default=None)
+    parser.add_argument("--cem-elite-fraction", type=float, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-step", action="store_true")
     parser.add_argument("--smoke", action="store_true")
