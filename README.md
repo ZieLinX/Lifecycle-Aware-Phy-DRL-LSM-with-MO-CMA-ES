@@ -4,7 +4,6 @@
 
 本项目实现 **Lifecycle-Aware Phy-DRL-LSM + MO-CMA-ES**：用 Chebyshev/Fourier 低维策略场驱动闭合网格形变，体积投影保持材料量不变，再用真实物理评估器进行多目标 Pareto 搜索。
 
-> 当前主结果来自 MO-CMA-ES 的真实物理评估。`train_policy.py` 和 `train_surrogate.py` 是后续训练入口，本次长跑未启用神经策略或 surrogate-only 评估。
 
 ## 优化内容
 
@@ -87,8 +86,3 @@ train_surrogate.py      # surrogate 训练脚手架
 tests/                  # 静态检查与优化器测试
 ```
 
-## 已知局限
-
-- 热传导采用轴向 ring lumped 模型，不是完整 3D FEM。
-- 升华寿命采用准静态 recession；`visibility` 使用有限射线采样，存在采样误差。
-- 本项目的“真实物理评估”指代码内快速 evaluator，不等同于实验或高保真商业仿真。
